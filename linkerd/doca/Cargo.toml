@@ -1,0 +1,14 @@
+[package]
+name = "linkerd-doca"
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+description = "Small DOCA initialization wrapper for linkerd2-proxy"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

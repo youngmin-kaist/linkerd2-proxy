@@ -16,6 +16,7 @@ members = [
     "linkerd/app",
     "linkerd/conditional",
     "linkerd/distribute",
+    "linkerd/doca",
     "linkerd/dns/name",
     "linkerd/dns",
     "linkerd/duplex",

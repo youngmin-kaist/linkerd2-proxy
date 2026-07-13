@@ -37,6 +37,15 @@ fn main() {
 
     linkerd_rustls::install_default_provider();
 
+    #[cfg(feature = "doca")]
+    match linkerd_doca::initialize() {
+        Ok(report) => info!("{}", report.log_summary()),
+        Err(error) => {
+            eprintln!("DOCA initialization failure: {error}");
+            std::process::exit(1);
+        }
+    }
+
     let mut metrics = linkerd_metrics::prom::Registry::default();
 
     // Load configuration from the environment without binding ports.

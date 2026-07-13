@@ -58,6 +58,8 @@ workspace = true
 features = [
     "arbitrary",
     "destination",
+    "inbound",
+    "outbound",
 ]
 
 [dependencies.tracing-subscriber]
