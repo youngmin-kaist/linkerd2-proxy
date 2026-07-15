@@ -38,13 +38,47 @@ fn main() {
     linkerd_rustls::install_default_provider();
 
     #[cfg(feature = "doca")]
-    match linkerd_doca::initialize() {
-        Ok(report) => info!("{}", report.log_summary()),
-        Err(error) => {
-            eprintln!("DOCA initialization failure: {error}");
-            std::process::exit(1);
+    let _doca_comch = {
+        match dmesh_doca::initialize() {
+            Ok(report) => info!("{}", report.log_summary()),
+            Err(error) => {
+                eprintln!("DOCA initialization failure: {error}");
+                std::process::exit(1);
+            }
         }
-    }
+        println!("Initializing DOCA comch server and datapath consumer...");
+        let dev_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_DEV_PCI_ADDR") {
+            Ok(addr) => addr,
+            Err(error) => {
+                eprintln!(
+                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}"
+                );
+                std::process::exit(EX_USAGE);
+            }
+        };
+        let rep_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_REP_PCI_ADDR") {
+            Ok(addr) => addr,
+            Err(error) => {
+                eprintln!(
+                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}"
+                );
+                std::process::exit(EX_USAGE);
+            }
+        };
+        let server_name = std::env::var("LINKERD2_PROXY_DOCA_SERVER_NAME")
+            .unwrap_or_else(|_| "DPUMesh".to_string());
+        println!("INitilize DPU");
+        match dmesh_doca::DocaComch::initialize_dpu(&dev_pci_addr, &rep_pci_addr, &server_name) {
+            Ok(comch) => {
+                info!("DOCA comch server and datapath consumer initialized");
+                comch
+            }
+            Err(error) => {
+                eprintln!("DOCA comch initialization failure: {error}");
+                std::process::exit(1);
+            }
+        }
+    };
 
     let mut metrics = linkerd_metrics::prom::Registry::default();
 

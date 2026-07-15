@@ -1,5 +1,5 @@
 [package]
-name = "linkerd-doca"
+name = "dmesh-doca"
 version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }

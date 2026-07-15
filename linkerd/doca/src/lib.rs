@@ -1,7 +1,8 @@
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString, NulError},
     fmt,
-    os::raw::{c_char, c_int},
+    os::raw::{c_char, c_int, c_void},
+    ptr::NonNull,
 };
 
 #[repr(C)]
@@ -21,9 +22,16 @@ struct RawProbeReport {
 }
 
 extern "C" {
-    fn linkerd_doca_probe(report: *mut RawProbeReport) -> c_int;
-    fn linkerd_doca_error_name(error: c_int) -> *const c_char;
-    fn linkerd_doca_error_descr(error: c_int) -> *const c_char;
+    fn dmesh_doca_probe(report: *mut RawProbeReport) -> c_int;
+    fn dmesh_doca_error_name(error: c_int) -> *const c_char;
+    fn dmesh_doca_error_descr(error: c_int) -> *const c_char;
+    fn dmesh_doca_init(
+        dev_pci_addr: *const c_char,
+        rep_pci_addr: *const c_char,
+        server_name: *const c_char,
+        handle: *mut *mut c_void,
+    ) -> c_int;
+    fn dmesh_doca_comch_destroy(handle: *mut c_void);
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +60,11 @@ pub struct Error {
     description: String,
 }
 
+#[derive(Debug)]
+pub struct DocaComch {
+    handle: NonNull<c_void>,
+}
+
 pub fn initialize() -> Result<ProbeReport, Error> {
     let mut raw = RawProbeReport {
         device_count: 0,
@@ -67,7 +80,7 @@ pub fn initialize() -> Result<ProbeReport, Error> {
         first_device_pci: [0; 64],
     };
 
-    let status = unsafe { linkerd_doca_probe(&mut raw) };
+    let status = unsafe { dmesh_doca_probe(&mut raw) };
     if status != 0 {
         return Err(Error::from_code(status));
     }
@@ -82,6 +95,36 @@ pub fn initialize() -> Result<ProbeReport, Error> {
         sha: LibraryStatus::from_code(raw.sha_status),
         dpa: LibraryStatus::from_code(raw.dpa_status),
     })
+}
+
+impl DocaComch {
+    pub fn initialize_dpu(
+        dev_pci_addr: &str,
+        rep_pci_addr: &str,
+        server_name: &str,
+    ) -> Result<Self, Error> {
+        let dev_pci_addr = CString::new(dev_pci_addr)?;
+        let rep_pci_addr = CString::new(rep_pci_addr)?;
+        let server_name = CString::new(server_name)?;
+        let mut handle = std::ptr::null_mut();
+
+        let status = unsafe {
+            dmesh_doca_init(
+                dev_pci_addr.as_ptr(),
+                rep_pci_addr.as_ptr(),
+                server_name.as_ptr(),
+                &mut handle,
+            )
+        };
+        if status != 0 {
+            println!("Failed to initialize DOCA comch server and datapath consumer: {}", Error::from_code(status));
+            return Err(Error::from_code(status));
+        }
+
+        Ok(Self {
+            handle: NonNull::new(handle).ok_or_else(|| Error::new(-1, "null DOCA comch handle"))?,
+        })
+    }
 }
 
 impl ProbeReport {
@@ -122,6 +165,26 @@ impl Error {
             description: error_description(code),
         }
     }
+
+    fn new(code: c_int, description: impl Into<String>) -> Self {
+        Self {
+            code,
+            name: "invalid argument".to_string(),
+            description: description.into(),
+        }
+    }
+}
+
+impl Drop for DocaComch {
+    fn drop(&mut self) {
+        unsafe { dmesh_doca_comch_destroy(self.handle.as_ptr()) };
+    }
+}
+
+impl From<NulError> for Error {
+    fn from(error: NulError) -> Self {
+        Self::new(-1, error.to_string())
+    }
 }
 
 impl fmt::Display for LibraryStatus {
@@ -143,11 +206,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 fn error_name(code: c_int) -> String {
-    unsafe { c_ptr_to_string(linkerd_doca_error_name(code)) }
+    unsafe { c_ptr_to_string(dmesh_doca_error_name(code)) }
 }
 
 fn error_description(code: c_int) -> String {
-    unsafe { c_ptr_to_string(linkerd_doca_error_descr(code)) }
+    unsafe { c_ptr_to_string(dmesh_doca_error_descr(code)) }
 }
 
 fn c_array_to_string<const N: usize>(array: &[c_char; N]) -> String {
