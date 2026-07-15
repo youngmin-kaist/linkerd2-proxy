@@ -572,6 +572,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmesh-doca"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "drain"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1807,14 +1815,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linkerd-doca"
-version = "0.1.0"
-dependencies = [
- "cc",
- "pkg-config",
-]
-
-[[package]]
 name = "linkerd-duplex"
 version = "0.1.0"
 dependencies = [
@@ -2847,10 +2847,10 @@ version = "0.1.0"
 name = "linkerd2-proxy"
 version = "0.1.0"
 dependencies = [
+ "dmesh-doca",
  "futures",
  "kubert-prometheus-tokio",
  "linkerd-app",
- "linkerd-doca",
  "linkerd-metrics",
  "linkerd-rustls",
  "linkerd-signal",
