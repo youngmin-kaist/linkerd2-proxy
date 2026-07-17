@@ -63,6 +63,7 @@ const STATE_RUNNING: c_int = 1;
 pub enum ConnState {
     Free,
     New,
+    ConsumerStarting,
     AwaitMetadata,
     Running,
     Error,
@@ -75,6 +76,7 @@ impl ConnState {
             2 => Self::AwaitMetadata,
             3 => Self::Running,
             4 => Self::Error,
+            5 => Self::ConsumerStarting,
             _ => Self::Free,
         }
     }
@@ -238,7 +240,7 @@ impl Driver {
                 ConnState::Running => Some(DmeshEvent::ConnReady(slot, self.conn_flow(slot))),
                 ConnState::Error => Some(DmeshEvent::ConnError(slot)),
                 ConnState::Free if prev != ConnState::Free => Some(DmeshEvent::ConnClosed(slot)),
-                _ => None, // New / AwaitMetadata are internal setup states
+                _ => None, // New / ConsumerStarting / AwaitMetadata are internal setup states
             };
             if let Some(ev) = ev {
                 // A dropped receiver just means nobody is listening; keep serving.
