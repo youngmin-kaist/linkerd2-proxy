@@ -8,6 +8,10 @@ publish = { workspace = true }
 description = "Small DOCA initialization wrapper for linkerd2-proxy"
 
 [dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros", "io-util"] }
 
 [build-dependencies]
 cc = "1"

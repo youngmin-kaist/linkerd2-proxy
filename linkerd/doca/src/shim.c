@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <doca_log.h>
 #include <doca_aes_gcm.h>
 #include <doca_comch_consumer.h>
 #include <doca_dev.h>
@@ -36,40 +37,36 @@ struct dmesh_doca_probe_report {
 	char first_device_pci[64];
 };
 
-struct dmesh_doca_comch {
-	struct objects objs;
-};
+// static void cleanup_comch(struct dmesh_doca_comch *handle)
+// {
+// 	if (handle == NULL)
+// 		return;
 
-static void cleanup_comch(struct dmesh_doca_comch *handle)
-{
-	if (handle == NULL)
-		return;
+// 	if (handle->objs.consumer != NULL)
+// 		(void)doca_ctx_stop(doca_comch_consumer_as_ctx(handle->objs.consumer));
 
-	if (handle->objs.consumer != NULL)
-		(void)doca_ctx_stop(doca_comch_consumer_as_ctx(handle->objs.consumer));
+// 	while (handle->objs.consumer != NULL && handle->objs.consumer_pe != NULL) {
+// 		enum doca_ctx_states state;
+// 		doca_error_t result;
 
-	while (handle->objs.consumer != NULL && handle->objs.consumer_pe != NULL) {
-		enum doca_ctx_states state;
-		doca_error_t result;
+// 		(void)doca_pe_progress(handle->objs.consumer_pe);
+// 		result = doca_ctx_get_state(doca_comch_consumer_as_ctx(handle->objs.consumer), &state);
+// 		if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+// 			break;
+// 	}
 
-		(void)doca_pe_progress(handle->objs.consumer_pe);
-		result = doca_ctx_get_state(doca_comch_consumer_as_ctx(handle->objs.consumer), &state);
-		if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
-			break;
-	}
+// 	clean_comch_consumer(handle->objs.consumer, handle->objs.consumer_pe);
+// 	handle->objs.consumer = NULL;
+// 	handle->objs.consumer_pe = NULL;
 
-	clean_comch_consumer(handle->objs.consumer, handle->objs.consumer_pe);
-	handle->objs.consumer = NULL;
-	handle->objs.consumer_pe = NULL;
+// 	if (handle->objs.consumer_mem != NULL) {
+// 		clean_local_mem_bufs(handle->objs.consumer_mem);
+// 		free(handle->objs.consumer_mem);
+// 		handle->objs.consumer_mem = NULL;
+// 	}
 
-	if (handle->objs.consumer_mem != NULL) {
-		clean_local_mem_bufs(handle->objs.consumer_mem);
-		free(handle->objs.consumer_mem);
-		handle->objs.consumer_mem = NULL;
-	}
-
-	cleanup_objects(&handle->objs);
-}
+// 	cleanup_objects(&handle->objs);
+// }
 
 static void copy_str(char *dst, size_t dst_len, const char *src)
 {
@@ -166,12 +163,142 @@ const char *dmesh_doca_error_descr(int32_t error)
 	return doca_error_get_descr((doca_error_t)error);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Data-path (consumer PE) accessors for the Rust AsyncFd driver.
+ *
+ * The consumer PE is created by the shared-infrastructure step of
+ * dmesh_doca_ctrl_advance(), so these return DOCA_ERROR_BAD_STATE until the
+ * first successful advance() call.
+ * ---------------------------------------------------------------------------
+ */
+
+int32_t dmesh_doca_data_get_fd(struct objects *objs, int *out_fd)
+{
+	doca_notification_handle_t handle;
+	doca_error_t result;
+
+	if (objs == NULL || out_fd == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+	if (objs->consumer_pe == NULL)
+		return DOCA_ERROR_BAD_STATE;
+
+	result = doca_pe_get_notification_handle(objs->consumer_pe, &handle);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	*out_fd = (int)handle;
+	return DOCA_SUCCESS;
+}
+
+int32_t dmesh_doca_data_arm(struct objects *objs)
+{
+	if (objs == NULL || objs->consumer_pe == NULL)
+		return DOCA_ERROR_BAD_STATE;
+
+	return doca_pe_request_notification(objs->consumer_pe);
+}
+
+/* Clear the notification and progress the consumer PE up to `budget` events.
+ * Returns the number of events processed via *out_drained (a full budget means
+ * more work is pending and the caller should not sleep). */
+int32_t dmesh_doca_data_clear_and_drain(struct objects *objs, int fd, int budget, int *out_drained)
+{
+	doca_error_t result;
+	int drained = 0;
+
+	if (objs == NULL || objs->consumer_pe == NULL || out_drained == NULL)
+		return DOCA_ERROR_BAD_STATE;
+
+	result = doca_pe_clear_notification(objs->consumer_pe, (doca_notification_handle_t)fd);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	while (drained < budget && doca_pe_progress(objs->consumer_pe) != 0)
+		drained++;
+
+	*out_drained = drained;
+	return DOCA_SUCCESS;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Connection registry / stats introspection.
+ * ---------------------------------------------------------------------------
+ */
+
+int32_t dmesh_doca_max_conns(void)
+{
+	return DMESH_MAX_CONNECTIONS;
+}
+
+/* Copy the flow identity (4-tuple + source workload) of a slot. The values
+ * are meaningful once the slot's metadata message arrived (state >= 2). */
+int32_t dmesh_doca_conn_flow_get(struct objects *objs, int32_t slot,
+				 uint32_t *src_ip, uint16_t *src_port,
+				 uint32_t *dst_ip, uint16_t *dst_port,
+				 char *workload, int32_t workload_len)
+{
+	struct dmesh_flow_id *flow;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	flow = &objs->conns[slot].flow;
+	if (src_ip != NULL)
+		*src_ip = flow->src_ip;
+	if (src_port != NULL)
+		*src_port = flow->src_port;
+	if (dst_ip != NULL)
+		*dst_ip = flow->dst_ip;
+	if (dst_port != NULL)
+		*dst_port = flow->dst_port;
+	if (workload != NULL && workload_len > 0)
+		snprintf(workload, (size_t)workload_len, "%s", flow->src_workload);
+	return DOCA_SUCCESS;
+}
+
+/* Returns the enum dmesh_conn_state value of a slot, or -1 on bad input */
+int32_t dmesh_doca_conn_state_get(struct objects *objs, int32_t slot)
+{
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return -1;
+
+	return (int32_t)objs->conns[slot].state;
+}
+
+void dmesh_doca_stats_get(struct objects *objs,
+			  int64_t *sent, int64_t *recv,
+			  int64_t *dma_pending, int64_t *dma_dropped)
+{
+	int64_t pending = 0, dropped = 0;
+	int i;
+
+	if (objs == NULL)
+		return;
+
+	for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
+		pending += objs->conns[i].dma_pending_cnt;
+		dropped += objs->conns[i].dma_dropped_copies;
+	}
+
+	if (sent != NULL)
+		*sent = (int64_t)objs->sent_msg_cnt;
+	if (recv != NULL)
+		*recv = (int64_t)objs->recv_msg_cnt;
+	if (dma_pending != NULL)
+		*dma_pending = pending;
+	if (dma_dropped != NULL)
+		*dma_dropped = dropped;
+}
+
 int32_t dmesh_doca_init(const char *dev_pci_addr,
 						  const char *rep_pci_addr,
 						  const char *server_name,
-						  struct dmesh_doca_comch **handle)
+						  struct objects **handle)
 {
-	struct dmesh_doca_comch *comch;
+	struct doca_log_backend *sdk_log;
+	struct objects *objs;
 	doca_error_t result;
 
 	fprintf(stderr, "[DMesh] Initializing DOCA objects with dev_pci_addr=%s, rep_pci_addr=%s, server_name=%s\n",
@@ -185,106 +312,76 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 
 	*handle = NULL;
 
-	comch = calloc(1, sizeof(*comch));
-	if (comch == NULL)
+	/* register a logger backend */
+	result = doca_log_backend_create_standard();
+	if (result != DOCA_SUCCESS) {
+		fprintf(stderr, "Failed to create standard log backend: %s\n", doca_error_get_name(result));
+		return result;
+	}
+
+    /* register a logger backend for internal SDK errors and warnings */
+	result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+	if (result != DOCA_SUCCESS) {
+		fprintf(stderr, "Failed to create log backend for SDK: %s\n", doca_error_get_name(result));
+		return result;
+	}
+	result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+    if (result != DOCA_SUCCESS) {
+		fprintf(stderr, "Failed to set log level for SDK log backend: %s\n", doca_error_get_name(result));
+		return result;
+    }
+	
+	objs = calloc(1, sizeof(*objs));
+	if (objs == NULL)
 		return DOCA_ERROR_NO_MEMORY;
 
-	result = open_doca_device_with_pci(dev_pci_addr, NULL, &comch->objs.dev);
+	result = open_doca_device_with_pci(dev_pci_addr, NULL, &objs->dev);
 	if (result != DOCA_SUCCESS)
 		goto free_handle;
+
 	fprintf(stderr, "Opened DOCA device %s\n", dev_pci_addr);
 
-	result = open_doca_device_rep_with_pci(comch->objs.dev,
+	result = open_doca_device_rep_with_pci(objs->dev,
 					       DOCA_DEVINFO_REP_FILTER_NET,
 					       rep_pci_addr,
-					       &comch->objs.rep_dev);
+					       &objs->rep_dev);
 	if (result != DOCA_SUCCESS)
 		goto cleanup_handle;
+
 	fprintf(stderr, "Opened DOCA device rep %s\n", rep_pci_addr);
 
-	result = init_comch_ctrl_path_server(server_name, &comch->objs, true);
+	/*
+	 * Start the comch control-path server WITHOUT blocking on the host
+	 * connection. start_comch_ctrl_path_server creates objs->pe itself and
+	 * leaves objs->phase = SERVER_STARTED. The remaining worker init (consumer,
+	 * DPA, mmap waits) is driven on-demand via the dmesh_doca_ctrl_* helpers
+	 * (get_fd/arm/drain/clear_and_drain/advance), which the caller runs against
+	 * the control PE notification fd.
+	 */
+	result = start_comch_ctrl_path_server(server_name, objs, true);
 	if (result != DOCA_SUCCESS)
 		goto cleanup_handle;
-	fprintf(stderr, "Initialized DOCA comch server %s\n", server_name);
 
-	result = init_comch_datapath_consumer(&comch->objs);
-	if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Initialized DOCA comch datapath consumer\n");
+	fprintf(stderr, "Started DOCA comch server %s (awaiting host connection)\n", server_name);
 
-	result = init_dpa_objects(&comch->objs);
-	if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Initialized DOCA DPA objects\n");
-
-	result = dmesh_doca_dpa_thread_create(comch->objs.dpa_thread);
-	if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Initialized DOCA DPA thread\n");
-	
-	result = init_comch_dpa_msgq(&comch->objs, comch->objs.consumer_pe);
-	if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Initialized DOCA DPA msgq\n");
-	
-	while (comch->objs.ring_mmap == NULL) {
-		doca_pe_progress(comch->objs.pe);
-	}
-	fprintf(stderr, "Received ring mmap from host\n");
-
-	/* setup DPA buffer array with remote mmap */
-    result = setup_dpa_buf_array(&comch->objs, 1024, comch->objs.ring_mmap);
-    if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Setup DPA buf array");
-
-    /* allocate local buffer and set mmap for PCI export */
-    result = alloc_buffer_and_set_mmap(&comch->objs.local_mmap, comch->objs.dev,
-                           &comch->objs.dma_buffer, 1024*1024,
-                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-    if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-
-	fprintf(stderr, "Waiting for remote mmap from host to be ready...\n");
-    while (comch->objs.remote_mmap == NULL) {
-		doca_pe_progress(comch->objs.pe);
-    }
-	fprintf(stderr, "Received remote mmap from host\n");	
-	
-    /* run DPA thread */
-    result = dmesh_doca_run_dpa_thread(&comch->objs, comch->objs.dpa_thread, comch->objs.dpa_comch);
-	if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Run DPA thread\n");	
-	
-    result = send_dma_request_to_dpa(&comch->objs);
-    if (result != DOCA_SUCCESS)
-		goto cleanup_handle;
-	fprintf(stderr, "Sending DMA requests to DPA\n");	
-
-	*handle = comch;
+	*handle = objs;
 	return DOCA_SUCCESS;
 
 cleanup_handle:
-	cleanup_comch(comch);
+	cleanup_objects(objs);
 free_handle:
-	free(comch);
+	free(objs);
 	return result;
 }
 
-int32_t dmesh_doca_comch_server_consumer_create(const char *dev_pci_addr,
-						const char *rep_pci_addr,
-						const char *server_name,
-						struct dmesh_doca_comch **handle)
-{
-	return dmesh_doca_init(dev_pci_addr, rep_pci_addr, server_name, handle);
-}
-
-void dmesh_doca_comch_destroy(struct dmesh_doca_comch *handle)
+void dmesh_doca_comch_destroy(struct objects *handle)
 {
 	if (handle == NULL)
 		return;
 
-	cleanup_comch(handle);
+	/* NOTE: partial teardown. cleanup_objects only releases cc_server/pe/
+	 * rep_dev/dev; consumer/DPA/mmap/buf_arr resources are not yet freed
+	 * (a full teardown is still TODO). */
+	cleanup_objects(handle);
 	free(handle);
 }

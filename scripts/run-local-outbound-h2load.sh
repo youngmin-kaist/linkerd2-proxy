@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/home/youngmin/linkerd2-proxy}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 LOG_DIR="${LOG_DIR:-$ROOT/target/local-outbound-h2load}"
 
 mkdir -p "$LOG_DIR"
@@ -84,20 +85,7 @@ if ! (echo >"/dev/tcp/127.0.0.1/8086") >/dev/null 2>&1; then
 fi
 echo "backend is listening on 127.0.0.1:8086"
 
-cargo run -p linkerd-app-integration --bin mock-identity \
-  >"$LOG_DIR/mock-identity.log" 2>&1 &
-PIDS+=("$!")
-wait_for_port mock-identity 8088
-
-cargo run -p linkerd-app-integration --bin mock-destination \
-  >"$LOG_DIR/mock-destination.log" 2>&1 &
-PIDS+=("$!")
-wait_for_port mock-destination 8089
-
-cargo run -p linkerd-app-integration --bin mock-policy \
-  >"$LOG_DIR/mock-policy.log" 2>&1 &
-PIDS+=("$!")
-wait_for_port mock-policy 8087
+source scripts/run-local-mock-services.sh
 
 PROXY_FEATURES="${PROXY_FEATURES:-allow-loopback}"
 cargo run -p linkerd2-proxy --features "$PROXY_FEATURES" \

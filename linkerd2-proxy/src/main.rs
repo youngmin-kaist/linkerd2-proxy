@@ -37,8 +37,10 @@ fn main() {
 
     linkerd_rustls::install_default_provider();
 
+    // Stage 1 (synchronous, pre-runtime): open the DOCA device and start the
+    // dmesh comch server. The async driver is spawned inside the runtime below.
     #[cfg(feature = "doca")]
-    let _doca_comch = {
+    let dmesh_doca = {
         match dmesh_doca::initialize() {
             Ok(report) => info!("{}", report.log_summary()),
             Err(error) => {
@@ -46,7 +48,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        println!("Initializing DOCA comch server and datapath consumer...");
         let dev_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_DEV_PCI_ADDR") {
             Ok(addr) => addr,
             Err(error) => {
@@ -66,12 +67,11 @@ fn main() {
             }
         };
         let server_name = std::env::var("LINKERD2_PROXY_DOCA_SERVER_NAME")
-            .unwrap_or_else(|_| "DPUMesh".to_string());
-        println!("INitilize DPU");
-        match dmesh_doca::DocaComch::initialize_dpu(&dev_pci_addr, &rep_pci_addr, &server_name) {
-            Ok(comch) => {
-                info!("DOCA comch server and datapath consumer initialized");
-                comch
+            .unwrap_or_else(|_| "DPUMesh0".to_string());
+        match dmesh_doca::DmeshDoca::initialize(&dev_pci_addr, &rep_pci_addr, &server_name) {
+            Ok(doca_handle) => {
+                info!(server = %server_name, "dmesh comch server started");
+                doca_handle
             }
             Err(error) => {
                 eprintln!("DOCA comch initialization failure: {error}");
@@ -97,6 +97,44 @@ fn main() {
     rt::build().block_on(async move {
         // Spawn a task to run in the background, exporting runtime metrics at a regular interval.
         rt::spawn_metrics_exporter(&mut metrics);
+
+        // Stage 2: drive the dmesh control/data paths event-driven (AsyncFd on
+        // the DOCA progress-engine fds). Host connections surface as events;
+        // each ready connection already has a DPA thread and DMA engine bound
+        // by the C state machine.
+        #[cfg(feature = "doca")]
+        {
+            let (dmesh_tx, mut dmesh_rx) = mpsc::unbounded_channel();
+            let driver = dmesh_doca::Driver::new(dmesh_doca, dmesh_tx);
+            tokio::spawn(async move {
+                match driver.run().await {
+                    Ok(()) => warn!("dmesh driver exited"),
+                    Err(error) => warn!(%error, "dmesh driver failed"),
+                }
+            });
+            tokio::spawn(async move {
+                while let Some(ev) = dmesh_rx.recv().await {
+                    match ev {
+                        dmesh_doca::DmeshEvent::InfraReady => {
+                            info!("dmesh infrastructure ready (DPA pool + consumer PE)")
+                        }
+                        dmesh_doca::DmeshEvent::ConnReady(slot, flow) => info!(
+                            slot,
+                            src = %flow.src,
+                            orig_dst = %flow.dst,
+                            workload = %flow.workload,
+                            "dmesh connection ready (DPA thread assigned)"
+                        ),
+                        dmesh_doca::DmeshEvent::ConnClosed(slot) => {
+                            info!(slot, "dmesh connection closed")
+                        }
+                        dmesh_doca::DmeshEvent::ConnError(slot) => {
+                            warn!(slot, "dmesh connection setup failed")
+                        }
+                    }
+                }
+            });
+        }
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         let shutdown_grace_period = config.shutdown_grace_period;

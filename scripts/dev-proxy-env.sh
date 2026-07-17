@@ -11,8 +11,23 @@
 #   cargo run -p linkerd2-proxy --features allow-loopback
 #   h2load -p http/1.1 -n100 -c10 http://127.0.0.1:4140/
 
-ROOT="${ROOT:-/home/youngmin/linkerd2-proxy}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT="${LINKERD2_PROXY_ROOT:-${ROOT:-$DEFAULT_ROOT}}"
 DATA="$ROOT/linkerd/app/integration/src/data"
+
+if [[ ! -f "$DATA/ca1.pem" ]]; then
+  DEFAULT_DATA="$DEFAULT_ROOT/linkerd/app/integration/src/data"
+  if [[ -f "$DEFAULT_DATA/ca1.pem" ]]; then
+    echo "Ignoring stale ROOT=$ROOT; using $DEFAULT_ROOT" >&2
+    ROOT="$DEFAULT_ROOT"
+    DATA="$DEFAULT_DATA"
+  else
+    echo "Missing identity trust anchor: $DATA/ca1.pem" >&2
+    echo "Set LINKERD2_PROXY_ROOT to your linkerd2-proxy checkout if needed." >&2
+    return 1 2>/dev/null || exit 1
+  fi
+fi
 IDENTITY="default.default.serviceaccount.identity.linkerd.cluster.local"
 
 export LINKERD2_PROXY_IDENTITY_LOCAL_NAME="$IDENTITY"
@@ -37,3 +52,7 @@ export MOCK_POLICY_BACKEND="${MOCK_POLICY_BACKEND:-127.0.0.1:8086}"
 
 export LINKERD2_PROXY_LOG="${LINKERD2_PROXY_LOG:-linkerd=debug,info}"
 export RUSTFLAGS="${RUSTFLAGS:---cfg tokio_unstable}"
+
+
+export LINKERD2_PROXY_DOCA_DEV_PCI_ADDR="03:00.1"
+export LINKERD2_PROXY_DOCA_REP_PCI_ADDR="94:00.1"

@@ -5,6 +5,12 @@ use std::{
     ptr::NonNull,
 };
 
+mod driver;
+mod io;
+
+pub use driver::{ConnState, DmeshEvent, Driver, FlowId, Stats, MAX_CONNS};
+pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawProbeReport {
@@ -61,7 +67,8 @@ pub struct Error {
 }
 
 #[derive(Debug)]
-pub struct DocaComch {
+// pub struct DocaComch {
+pub struct DmeshDoca {
     handle: NonNull<c_void>,
 }
 
@@ -97,11 +104,8 @@ pub fn initialize() -> Result<ProbeReport, Error> {
     })
 }
 
-impl DocaComch {
-    pub fn initialize_dpu(
-        dev_pci_addr: &str,
-        rep_pci_addr: &str,
-        server_name: &str,
+impl DmeshDoca {
+    pub fn initialize(dev_pci_addr: &str, rep_pci_addr: &str,server_name: &str,
     ) -> Result<Self, Error> {
         let dev_pci_addr = CString::new(dev_pci_addr)?;
         let rep_pci_addr = CString::new(rep_pci_addr)?;
@@ -124,6 +128,16 @@ impl DocaComch {
         Ok(Self {
             handle: NonNull::new(handle).ok_or_else(|| Error::new(-1, "null DOCA comch handle"))?,
         })
+    }
+
+    pub(crate) fn raw(&self) -> *mut c_void {
+        self.handle.as_ptr()
+    }
+}
+
+impl Error {
+    pub(crate) fn from_doca(code: c_int) -> Self {
+        Self::from_code(code)
     }
 }
 
@@ -166,7 +180,7 @@ impl Error {
         }
     }
 
-    fn new(code: c_int, description: impl Into<String>) -> Self {
+    pub(crate) fn new(code: c_int, description: impl Into<String>) -> Self {
         Self {
             code,
             name: "invalid argument".to_string(),
@@ -175,7 +189,7 @@ impl Error {
     }
 }
 
-impl Drop for DocaComch {
+impl Drop for DmeshDoca {
     fn drop(&mut self) {
         unsafe { dmesh_doca_comch_destroy(self.handle.as_ptr()) };
     }
