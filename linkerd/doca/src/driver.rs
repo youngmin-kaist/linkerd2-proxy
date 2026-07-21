@@ -75,6 +75,8 @@ extern "C" {
         pos: u32,
         len: u32,
     ) -> c_int;
+    // Flow mode of a slot: 0 = client, 1 = backend provider.
+    fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Reverse path: queue response bytes for DMA back to the host. Returns the
     // number of bytes accepted (>=0) or a negative doca_error_t.
     fn dmesh_doca_conn_send(
@@ -124,6 +126,9 @@ pub struct FlowId {
     pub dst: std::net::SocketAddrV4,
     /// Source workload identity (pod / service-account) for policy & telemetry.
     pub workload: String,
+    /// True for a BACKEND-mode connection: the host end provides the service
+    /// at `dst`; the connector reaches it through this channel instead of TCP.
+    pub is_backend: bool,
 }
 
 /// Events emitted by the driver as the shared state machine progresses.
@@ -383,10 +388,13 @@ impl Driver {
         // inet_addr() stores the address bytes in network order in memory;
         // both PCIe endpoints are little-endian, so the raw u32's LE bytes
         // are exactly the network-order octets.
+        let is_backend =
+            unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
         FlowId {
             src: std::net::SocketAddrV4::new(src_ip.to_le_bytes().into(), src_port),
             dst: std::net::SocketAddrV4::new(dst_ip.to_le_bytes().into(), dst_port),
             workload,
+            is_backend,
         }
     }
 

@@ -13,6 +13,41 @@ pub use driver::{
 };
 pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
 
+/// Registry of DMA backend channels: a BACKEND-mode host connection provides a
+/// service at some address, and the outbound connector takes the DmeshIo from
+/// here instead of dialing TCP. One channel per address; `take` hands the
+/// (long-lived, h2-multiplexed) connection out once.
+pub mod backend {
+    use crate::DmeshIo;
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn reg() -> &'static Mutex<HashMap<SocketAddr, DmeshIo>> {
+        static R: OnceLock<Mutex<HashMap<SocketAddr, DmeshIo>>> = OnceLock::new();
+        R.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn publish(addr: SocketAddr, io: DmeshIo) {
+        tracing::info!(%addr, "dmesh backend channel published");
+        reg().lock().unwrap().insert(addr, io);
+    }
+
+    pub fn take(addr: &SocketAddr) -> Option<DmeshIo> {
+        let io = reg().lock().unwrap().remove(addr);
+        if io.is_some() {
+            tracing::info!(%addr, "dmesh backend channel taken by connector");
+        }
+        io
+    }
+
+    pub fn contains(addr: &SocketAddr) -> bool {
+        reg().lock().unwrap().contains_key(addr)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawProbeReport {

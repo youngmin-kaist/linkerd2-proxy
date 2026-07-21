@@ -88,6 +88,17 @@ pub async fn serve<N>(
                     return;
                 }
 
+                // BACKEND-mode connections are not inbound flows: the host end
+                // provides the service at flow.dst, and the outbound connector
+                // (DmeshOrTcp) picks this DmeshIo up from the registry instead
+                // of dialing TCP. Nothing to serve here.
+                if flow.is_backend {
+                    let addr = SocketAddr::V4(flow.dst);
+                    info!(slot, %addr, "dmesh backend channel ready");
+                    dmesh_doca::backend::publish(addr, io);
+                    continue;
+                }
+
                 let target = DmeshTarget::from(&flow);
                 let span = debug_span!("dmesh", slot, src = %flow.src, orig_dst = %flow.dst);
                 let svc = outbound.new_service(target);

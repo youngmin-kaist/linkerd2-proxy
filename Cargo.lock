@@ -580,6 +580,7 @@ dependencies = [
  "linkerd-io",
  "pkg-config",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1712,6 +1713,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
+ "dmesh-doca",
  "futures",
  "futures-util",
  "http",

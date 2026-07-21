@@ -13,7 +13,7 @@ This is used by tests and the executable.
 
 [features]
 allow-loopback = ["linkerd-app-outbound/allow-loopback"]
-doca = ["dep:dmesh-doca"]
+doca = ["dep:dmesh-doca", "linkerd-app-outbound/doca"]
 log-streaming = ["linkerd-app-admin/log-streaming"]
 pprof = ["linkerd-app-admin/pprof"]
 

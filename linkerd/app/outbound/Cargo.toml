@@ -12,6 +12,7 @@ Configures and runs the outbound proxy
 [features]
 default = []
 allow-loopback = []
+doca = ["dep:dmesh-doca"]
 test-subscriber = []
 test-util = ["linkerd-app-test", "linkerd-meshtls/test-util", "dep:http-body"]
 
@@ -19,6 +20,7 @@ prometheus-client-rust-242 = [] # TODO
 
 [dependencies]
 ahash = "0.8"
+dmesh-doca = { path = "../../doca", optional = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true, optional = true }
@@ -29,7 +31,7 @@ parking_lot = "0.12"
 pin-project = "1"
 prometheus-client = { workspace = true }
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "net"] }
 tonic = { workspace = true, default-features = false }
 tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true }

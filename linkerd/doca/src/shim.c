@@ -383,6 +383,15 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
  * response larger than tx_staging_len could wrap and overwrite bytes the host
  * has not DMA'd. Fine for the current sub-buffer responses; a staging watermark
  * (mirror of the recv path) is the general fix. */
+/* Flow mode of a slot: 0 = client flow, 1 = backend provider (see
+ * DMESH_FLOW_MODE_*). Negative doca_error_t on bad args. */
+int32_t dmesh_doca_conn_mode_get(struct objects *objs, int32_t slot)
+{
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
+	return (int32_t)objs->conns[slot].flow.mode;
+}
+
 int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
 			     const uint8_t *data, size_t len)
 {
@@ -390,11 +399,30 @@ int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
 	size_t sent = 0;
 
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS || data == NULL)
-		return DOCA_ERROR_INVALID_VALUE;
+		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 
 	conn = &objs->conns[slot];
+
+	/* Backend channels (안 2): push with this connection's doca_dma engine -
+	 * no rcv_ring, no host DPA. One <=8KB batch outstanding; the driver
+	 * retries the remainder on later ticks. */
+	if (conn->flow.mode == DMESH_FLOW_MODE_BACKEND) {
+		if (!conn->reverse_exported || conn->tx_staging == NULL)
+			return -(int32_t)DOCA_ERROR_BAD_STATE;
+		while (sent < len) {
+			int r = dmesh_dma_push_backend(conn, data + sent, len - sent);
+
+			if (r < 0)
+				return sent > 0 ? (int32_t)sent : (int32_t)r;
+			if (r == 0)
+				break;          /* batch in flight; retry later */
+			sent += (size_t)r;
+		}
+		return (int32_t)sent;
+	}
+
 	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->rcv_ring == NULL)
-		return DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
+		return -(int32_t)DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
 
 	while (sent < len) {
 		size_t remaining = len - sent;

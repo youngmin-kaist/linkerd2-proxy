@@ -17,8 +17,18 @@ pub struct Connect {
 #[derive(Clone, Debug)]
 pub struct PreventLoopback<S>(S);
 
+/// Physical connector that reaches DMA-provided backends through their
+/// registered dmesh channel and everything else via TCP. A backend host
+/// process (DMESH_BACKEND_CONNECT) publishes one long-lived DmeshIo per
+/// service address into `dmesh_doca::backend`; the h2 client caches the one
+/// connection it gets, which matches the one-channel-per-service model.
+#[cfg(feature = "doca")]
+#[derive(Clone, Debug)]
+pub struct DmeshOrTcp(PreventLoopback<ConnectTcp>);
+
 // === impl Outbound ===
 
+#[cfg(not(feature = "doca"))]
 impl Outbound<()> {
     pub fn to_tcp_connect(&self) -> Outbound<PreventLoopback<ConnectTcp>> {
         let connect = PreventLoopback(ConnectTcp::new(
@@ -26,6 +36,52 @@ impl Outbound<()> {
             self.config.proxy.connect.user_timeout,
         ));
         self.clone().with_stack(connect)
+    }
+}
+
+#[cfg(feature = "doca")]
+impl Outbound<()> {
+    pub fn to_tcp_connect(&self) -> Outbound<DmeshOrTcp> {
+        let connect = DmeshOrTcp(PreventLoopback(ConnectTcp::new(
+            self.config.proxy.connect.keepalive,
+            self.config.proxy.connect.user_timeout,
+        )));
+        self.clone().with_stack(connect)
+    }
+}
+
+#[cfg(feature = "doca")]
+impl<T> svc::Service<T> for DmeshOrTcp
+where
+    T: svc::Param<Remote<ServerAddr>>,
+{
+    type Response = (
+        io::EitherIo<io::ScopedIo<tokio::net::TcpStream>, dmesh_doca::DmeshIo>,
+        Local<ClientAddr>,
+    );
+    type Error = io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<Self::Response>> + Send + Sync + 'static>,
+    >;
+
+    #[inline]
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Both inner paths (ConnectTcp, registry lookup) are always ready.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, ep: T) -> Self::Future {
+        let Remote(ServerAddr(addr)) = ep.param();
+        if let Some(dio) = dmesh_doca::backend::take(&addr) {
+            tracing::info!(server.addr = %addr, "Connecting via dmesh DMA backend channel");
+            let local = Local(ClientAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+            return Box::pin(future::ready(Ok((io::EitherIo::Right(dio), local))));
+        }
+        let fut = self.0.call(ep);
+        Box::pin(async move {
+            let (tcp, local) = fut.await?;
+            Ok((io::EitherIo::Left(tcp), local))
+        })
     }
 }
 
