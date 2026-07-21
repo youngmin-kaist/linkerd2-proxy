@@ -8,6 +8,8 @@ publish = { workspace = true }
 description = "Small DOCA initialization wrapper for linkerd2-proxy"
 
 [dependencies]
+async-trait = "0.1"
+linkerd-io = { path = "../io" }
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]

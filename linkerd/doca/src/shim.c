@@ -22,6 +22,8 @@
 #include "dma.h"
 #include "object.h"
 #include "dpa.h"
+#include "dpa_common.h"
+#include "ring.h"
 
 struct dmesh_doca_probe_report {
 	uint32_t device_count;
@@ -268,7 +270,7 @@ int32_t dmesh_doca_conn_state_get(struct objects *objs, int32_t slot)
 }
 
 void dmesh_doca_stats_get(struct objects *objs,
-			  int64_t *sent, int64_t *recv,
+			  int64_t *sent, int64_t *recv, int64_t *recv_bytes,
 			  int64_t *dma_pending, int64_t *dma_dropped)
 {
 	int64_t pending = 0, dropped = 0;
@@ -286,10 +288,154 @@ void dmesh_doca_stats_get(struct objects *objs,
 		*sent = (int64_t)objs->sent_msg_cnt;
 	if (recv != NULL)
 		*recv = (int64_t)objs->recv_msg_cnt;
+	if (recv_bytes != NULL)
+		*recv_bytes = (int64_t)objs->recv_bytes;
 	if (dma_pending != NULL)
 		*dma_pending = pending;
 	if (dma_dropped != NULL)
 		*dma_dropped = dropped;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Zero-copy recv: expose the staging buffer + completed-segment queue so the
+ * Rust DmeshIo can read DMA'd bytes directly out of the mapped staging region,
+ * without any extra copy on the DPU.
+ * ---------------------------------------------------------------------------
+ */
+
+/* Base pointer + length of a connection's staging buffer (where the DPA DMAs
+ * host bytes). Valid once the connection reached DMESH_CONN_RUNNING. */
+int32_t dmesh_doca_conn_staging_base(struct objects *objs, int32_t slot,
+				     const uint8_t **out_base, size_t *out_len)
+{
+	struct dmesh_conn *conn;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS ||
+	    out_base == NULL || out_len == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	conn = &objs->conns[slot];
+	if (conn->dma_buffer == NULL || conn->local_mmap == NULL)
+		return DOCA_ERROR_BAD_STATE;
+
+	*out_base = (const uint8_t *)conn->dma_buffer;
+	*out_len = BUFFER_SIZE;
+	return DOCA_SUCCESS;
+}
+
+/* Pop the next completed recv segment for a slot into (*out_pos, *out_len).
+ * Returns DOCA_SUCCESS with a segment, or DOCA_ERROR_EMPTY when none pending.
+ * Single-consumer: only the driver task calls this. */
+int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
+				 uint32_t *out_pos, uint32_t *out_len)
+{
+	struct dmesh_conn *conn;
+	struct dmesh_recv_seg *seg;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS ||
+	    out_pos == NULL || out_len == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	conn = &objs->conns[slot];
+	if (conn->recv_seg_cnt == 0)
+		return DOCA_ERROR_EMPTY;
+
+	seg = &conn->recv_segs[conn->recv_seg_head];
+	*out_pos = seg->pos;
+	*out_len = seg->len;
+	conn->recv_seg_head = (conn->recv_seg_head + 1) % DMESH_RECV_SEG_MAX;
+	conn->recv_seg_cnt--;
+	return DOCA_SUCCESS;
+}
+
+/* Release a segment after the reader consumed its bytes. TODO(flow-control):
+ * this is where a staging-buffer read watermark would be published back to the
+ * DPA to gate reuse; today the staging ring has no producer backpressure, so
+ * this only advances an accounting counter. */
+int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
+				     uint32_t pos, uint32_t len)
+{
+	(void)pos;
+	(void)len;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	return DOCA_SUCCESS;
+}
+
+/* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
+ * DPA runs) fires a completion only when the copy is a multiple of 128B, or a
+ * single sub-block <=128B. Emit the largest 128-aligned copy (<=8064 = 63*128,
+ * under the 8KB single-DMA limit); the final <=128B tail is a valid sub-block.
+ * The host reassembles the response byte stream from the segments. */
+#define DMESH_TX_DMA_MAXMUL 8064
+
+/* Reverse (response) path: queue outbound bytes for DMA back to the host's
+ * rcvbuf. Copies data into this connection's tx_staging and appends
+ * descriptor(s) to its rcv_ring; the host's DPA thread polls the ring and
+ * performs the DPU->host DMA. Returns the number of bytes accepted (may be < len
+ * when the ring is momentarily full - the driver retries the remainder), or a
+ * negative doca_error_t. Single-producer: only the driver task calls this.
+ *
+ * TODO(flow-control): tx_staging has no host-consumption backpressure yet, so a
+ * response larger than tx_staging_len could wrap and overwrite bytes the host
+ * has not DMA'd. Fine for the current sub-buffer responses; a staging watermark
+ * (mirror of the recv path) is the general fix. */
+int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
+			     const uint8_t *data, size_t len)
+{
+	struct dmesh_conn *conn;
+	size_t sent = 0;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS || data == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	conn = &objs->conns[slot];
+	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->rcv_ring == NULL)
+		return DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
+
+	while (sent < len) {
+		size_t remaining = len - sent;
+		size_t chunk;
+		struct dma_desc *desc;
+
+		/* 128-align the copy (see DMESH_TX_DMA_MAXMUL): largest multiple of
+		 * 128 up to 8064, or a single <=128B sub-block for the tail. */
+		if (remaining <= 128)
+			chunk = remaining;
+		else if (remaining >= DMESH_TX_DMA_MAXMUL)
+			chunk = DMESH_TX_DMA_MAXMUL;
+		else
+			chunk = remaining & ~(size_t)127;
+		if (chunk > conn->tx_staging_len)
+			break;   /* cannot happen: chunk <= 8KB << tx_staging_len */
+
+		/* Non-blocking ring check: report a partial send rather than
+		 * busy-waiting in the driver thread if the host is behind. */
+		if (conn->rcv_ring->head - conn->rcv_ring->ctrl->consumer_head >= conn->rcv_ring->size)
+			break;
+
+		/* wrap the staging write cursor if the chunk would overrun */
+		if ((size_t)conn->tx_pos + chunk > conn->tx_staging_len)
+			conn->tx_pos = 0;
+
+		memcpy((uint8_t *)conn->tx_staging + conn->tx_pos, data + sent, chunk);
+
+		desc = get_next_dma_desc(conn->rcv_ring);
+		desc->mmap = 0;   /* kernel uses thread_arg->host_mmap as the source */
+		desc->addr = (uint64_t)conn->tx_staging + conn->tx_pos;
+		desc->size = chunk;
+		commit_dma_desc(conn->rcv_ring);
+
+		conn->tx_pos += (uint32_t)chunk;
+		if (conn->tx_pos >= conn->tx_staging_len)
+			conn->tx_pos = 0;
+		sent += chunk;
+	}
+
+	return (int32_t)sent;
 }
 
 int32_t dmesh_doca_init(const char *dev_pci_addr,

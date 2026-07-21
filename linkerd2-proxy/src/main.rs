@@ -99,42 +99,21 @@ fn main() {
         rt::spawn_metrics_exporter(&mut metrics);
 
         // Stage 2: drive the dmesh control/data paths event-driven (AsyncFd on
-        // the DOCA progress-engine fds). Host connections surface as events;
-        // each ready connection already has a DPA thread and DMA engine bound
-        // by the C state machine.
+        // the DOCA progress-engine fds). The event stream + registrar are handed
+        // to the app's dmesh acceptor (spawned after the app is built) so
+        // DMA-received connections flow through the real outbound stack.
         #[cfg(feature = "doca")]
-        {
-            let (dmesh_tx, mut dmesh_rx) = mpsc::unbounded_channel();
-            let driver = dmesh_doca::Driver::new(dmesh_doca, dmesh_tx);
+        let dmesh_acceptor = {
+            let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
+            let (driver, registrar) = dmesh_doca::Driver::new(dmesh_doca, dmesh_tx);
             tokio::spawn(async move {
                 match driver.run().await {
                     Ok(()) => warn!("dmesh driver exited"),
                     Err(error) => warn!(%error, "dmesh driver failed"),
                 }
             });
-            tokio::spawn(async move {
-                while let Some(ev) = dmesh_rx.recv().await {
-                    match ev {
-                        dmesh_doca::DmeshEvent::InfraReady => {
-                            info!("dmesh infrastructure ready (DPA pool + consumer PE)")
-                        }
-                        dmesh_doca::DmeshEvent::ConnReady(slot, flow) => info!(
-                            slot,
-                            src = %flow.src,
-                            orig_dst = %flow.dst,
-                            workload = %flow.workload,
-                            "dmesh connection ready (DPA thread assigned)"
-                        ),
-                        dmesh_doca::DmeshEvent::ConnClosed(slot) => {
-                            info!(slot, "dmesh connection closed")
-                        }
-                        dmesh_doca::DmeshEvent::ConnError(slot) => {
-                            warn!(slot, "dmesh connection setup failed")
-                        }
-                    }
-                }
-            });
-        }
+            (dmesh_rx, registrar)
+        };
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         let shutdown_grace_period = config.shutdown_grace_period;
@@ -158,6 +137,13 @@ fn main() {
                 std::process::exit(1);
             }
         };
+
+        // Drive DMA-received connections through the outbound stack.
+        #[cfg(feature = "doca")]
+        {
+            let (dmesh_rx, registrar) = dmesh_acceptor;
+            app.spawn_dmesh(dmesh_rx, registrar);
+        }
 
         info!("Admin interface on {}", app.admin_addr());
         info!("Inbound interface on {}", app.inbound_addr());

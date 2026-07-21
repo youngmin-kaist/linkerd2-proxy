@@ -4,6 +4,8 @@
 #![allow(opaque_hidden_inferred_bound)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "doca")]
+pub mod dmesh;
 pub mod dst;
 pub mod env;
 pub mod identity;
@@ -21,7 +23,7 @@ use linkerd_app_core::{
     dns, drain,
     metrics::{legacy::FmtMetrics, prom},
     serve,
-    svc::Param,
+    svc::{self, Param},
     tls_info,
     transport::{addrs::*, listen::Bind},
     Error, ProxyRuntime,
@@ -82,6 +84,10 @@ pub struct App {
     outbound_addr_additional: Option<Local<ServerAddr>>,
     start_proxy: Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
     tap: tap::Tap,
+    #[cfg(feature = "doca")]
+    dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo>,
+    #[cfg(feature = "doca")]
+    dmesh_drain: drain::Watch,
 }
 
 // === impl Config ===
@@ -267,7 +273,21 @@ impl Config {
             .bind(&outbound.config().proxy.server)
             .expect("Failed to bind outbound listener");
         let outbound_metrics = outbound.metrics();
+        // Second outbound instantiation over I = DmeshIo, fed by the DMA path.
+        // `mk` consumes `self`, so clone the (cloneable) Outbound and policies.
+        #[cfg(feature = "doca")]
+        let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = outbound
+            .clone()
+            .mk(
+                dst.profiles.clone(),
+                outbound_policies.clone(),
+                dst.resolve.clone(),
+            );
         let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
+
+        // Keep a drain subscriber for the dmesh acceptor (spawned post-build).
+        #[cfg(feature = "doca")]
+        let dmesh_drain = drain_rx.clone();
 
         // Build a task that initializes and runs the proxy stacks.
         let start_proxy = {
@@ -330,6 +350,10 @@ impl Config {
             outbound_addr_additional,
             start_proxy,
             tap,
+            #[cfg(feature = "doca")]
+            dmesh_outbound,
+            #[cfg(feature = "doca")]
+            dmesh_drain,
         })
     }
 
@@ -354,6 +378,23 @@ impl Config {
 impl App {
     pub fn admin_addr(&self) -> Local<ServerAddr> {
         self.admin.listen_addr
+    }
+
+    /// Spawn the DMA (dmesh) acceptor: DMA-received connections are driven
+    /// through the outbound stack. `events` is the driver's event stream and
+    /// `registrar` binds per-connection IO handles back to the driver.
+    #[cfg(feature = "doca")]
+    pub fn spawn_dmesh(
+        &self,
+        events: mpsc::UnboundedReceiver<dmesh_doca::DmeshEvent>,
+        registrar: dmesh_doca::Registrar,
+    ) {
+        let outbound = self.dmesh_outbound.clone();
+        let shutdown = self.dmesh_drain.clone().signaled();
+        tokio::spawn(
+            dmesh::serve(events, registrar, outbound, shutdown)
+                .instrument(info_span!("dmesh").or_current()),
+        );
     }
 
     pub fn inbound_addr(&self) -> Local<ServerAddr> {

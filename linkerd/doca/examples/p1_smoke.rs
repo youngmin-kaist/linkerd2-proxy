@@ -41,7 +41,7 @@ fn main() {
 
     rt.block_on(async move {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let driver = Driver::new(doca, tx);
+        let (driver, _registrar) = Driver::new(doca, tx);
         let mut driver_task = tokio::spawn(driver.run());
 
         let deadline = tokio::time::sleep(Duration::from_secs(secs));

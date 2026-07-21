@@ -13,6 +13,7 @@ fn main() {
         "../../../DPUMesh/dma.c",
         "../../../DPUMesh/dpa.c",
         "../../../DPUMesh/object.c",
+        "../../../DPUMesh/ring.c",
         "../../../DPUMesh/build/device/dpa_kernel.a",
         "../../../DPUMesh/buffer.h",
         "../../../DPUMesh/comch_client.h",
@@ -59,6 +60,7 @@ fn main() {
         .file("../../../DPUMesh/dma.c")
         .file("../../../DPUMesh/dpa.c")
         .file("../../../DPUMesh/object.c")
+        .file("../../../DPUMesh/ring.c")
         .flag_if_supported("-Wno-deprecated-declarations")
         .define("ALLOW_EXPERIMENTAL_API", None)
         .define("DOCA_ALLOW_EXPERIMENTAL_API", None)

@@ -8,7 +8,9 @@ use std::{
 mod driver;
 mod io;
 
-pub use driver::{ConnState, DmeshEvent, Driver, FlowId, Stats, MAX_CONNS};
+pub use driver::{
+    ConnState, DmeshEvent, Driver, FlowId, Registrar, Registration, Stats, MAX_CONNS,
+};
 pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
 
 #[repr(C)]
