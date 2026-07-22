@@ -1,10 +1,10 @@
-use linkerd_app_core::Result;
+use linkerd_app_core::{proxy::http::BoxBody, Result};
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Pprof;
 
 impl Pprof {
-    pub async fn profile<B>(self, req: http::Request<B>) -> Result<http::Response<hyper::Body>> {
+    pub async fn profile<B>(self, req: http::Request<B>) -> Result<http::Response<BoxBody>> {
         use pprof::protos::Message;
 
         fn query_param<'r, B>(req: &'r http::Request<B>, name: &'static str) -> Option<&'r str> {
@@ -56,7 +56,7 @@ impl Pprof {
 
         Ok(http::Response::builder()
             .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .body(hyper::Body::from(pb_gz))
+            .body(BoxBody::new(http_body_util::Full::new(bytes::Bytes::from(pb_gz))))
             .expect("response must be valid"))
     }
 }
