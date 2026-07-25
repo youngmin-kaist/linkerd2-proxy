@@ -77,14 +77,18 @@ extern "C" {
     ) -> c_int;
     // Flow mode of a slot: 0 = client, 1 = backend provider.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
-    // Reverse path: queue response bytes for DMA back to the host. Returns the
-    // number of bytes accepted (>=0) or a negative doca_error_t.
-    fn dmesh_doca_conn_send(
+    // Report the connection's mapped tx_staging region (usable base + len) so
+    // the writer stages response bytes in place. Negative doca_error_t until
+    // the reverse path is ready.
+    fn dmesh_doca_conn_tx_staging(
         objs: *mut c_void,
         slot: i32,
-        data: *const u8,
-        len: usize,
+        out_base: *mut usize,
+        out_len: *mut usize,
     ) -> i32;
+    // Publish response bytes already staged at [pos, pos+len) (no memcpy).
+    // Returns bytes accepted (>=0, may be < len) or a negative doca_error_t.
+    fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
 }
 
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
@@ -200,6 +204,10 @@ pub struct Driver {
     reg_rx: mpsc::UnboundedReceiver<Registration>,
     conn_states: [ConnState; MAX_CONNS],
     handles: [Option<crate::DmeshIoHandle>; MAX_CONNS],
+    // Whether a slot's tx_staging region has been reported to its handle yet.
+    // The reverse path becomes ready a tick or two after registration, so this
+    // is retried until `dmesh_doca_conn_tx_staging` succeeds.
+    tx_set: [bool; MAX_CONNS],
     // DPU-internal latency probe: t_in set when a forward segment is delivered,
     // measured when the response leaves via pump_send. (linkerd + backend time.)
     t_in: Option<std::time::Instant>,
@@ -233,6 +241,7 @@ impl Driver {
             reg_rx,
             conn_states: [ConnState::Free; MAX_CONNS],
             handles: [NONE; MAX_CONNS],
+            tx_set: [false; MAX_CONNS],
             t_in: None,
             dpu_sum_us: 0,
             dpu_cnt: 0,
@@ -254,7 +263,30 @@ impl Driver {
             if rc == 0 && !base.is_null() {
                 handle.set_staging(base as usize, len);
             }
+            self.tx_set[slot] = false;
             self.handles[slot] = Some(handle);
+        }
+    }
+
+    /// Report each slot's tx_staging region to its handle once the reverse path
+    /// is ready (retried every tick until it succeeds). Enables write-side
+    /// zero-copy: the stack copies response bytes straight into staging.
+    fn wire_tx_staging(&mut self) {
+        for slot in 0..MAX_CONNS {
+            if self.tx_set[slot] {
+                continue;
+            }
+            let Some(handle) = self.handles[slot].as_ref() else {
+                continue;
+            };
+            let mut base: usize = 0;
+            let mut len: usize = 0;
+            let rc =
+                unsafe { dmesh_doca_conn_tx_staging(self.doca.raw(), slot as i32, &mut base, &mut len) };
+            if rc == 0 && base != 0 && len > 0 {
+                handle.set_tx_staging(base, len);
+                self.tx_set[slot] = true;
+            }
         }
     }
 
@@ -281,30 +313,30 @@ impl Driver {
         }
     }
 
-    /// Push response bytes the stack wrote (DmeshIo tx) back to the host over
-    /// the reverse DMA path. Partial sends (ring full / reverse not ready yet)
-    /// are returned to the tx queue and retried on the next tick.
+    /// Publish response bytes the stack staged (write-side zero-copy: the bytes
+    /// are already in tx_staging) back to the host over the reverse DMA path.
+    /// Each contiguous unpublished run is handed to the C side, which emits DMA
+    /// descriptors / push batches without copying. Partial acceptance (ring or
+    /// backend batch momentarily full) is retried on the next tick.
     fn pump_send(&mut self) {
-        const TX_CHUNK: usize = 64 * 1024;
+        self.wire_tx_staging();
         for slot in 0..MAX_CONNS {
             let Some(handle) = self.handles[slot].as_ref() else {
                 continue;
             };
             loop {
-                let buf = handle.take_tx(TX_CHUNK);
-                if buf.is_empty() {
+                let Some((pos, len)) = handle.take_staged() else {
                     break;
-                }
-                let rc = unsafe {
-                    dmesh_doca_conn_send(self.doca.raw(), slot as i32, buf.as_ptr(), buf.len())
                 };
+                let rc =
+                    unsafe { dmesh_doca_conn_send_staged(self.doca.raw(), slot as i32, pos, len) };
                 if rc < 0 {
                     // reverse path not ready yet (BAD_STATE) or error: retry later
-                    handle.untake_tx(&buf);
                     break;
                 }
-                let sent = rc as usize;
+                let sent = rc as u32;
                 if sent > 0 {
+                    handle.advance_publish(sent);
                     if let Some(t) = self.t_in.take() {
                         self.dpu_sum_us += t.elapsed().as_micros() as u64;
                         self.dpu_cnt += 1;
@@ -317,12 +349,11 @@ impl Driver {
                         }
                     }
                 }
-                if sent < buf.len() {
-                    // ring momentarily full: return the remainder, retry next tick
-                    handle.untake_tx(&buf[sent..]);
+                if sent < len {
+                    // ring / batch momentarily full: retry the rest next tick
                     break;
                 }
-                // fully accepted; loop to drain any further tx bytes
+                // fully accepted; loop to drain the wrapped remainder if any
             }
         }
     }
@@ -427,12 +458,15 @@ impl Driver {
                 _ => None, // New / ConsumerStarting / AwaitMetadata are internal setup states
             };
 
-            // A slot leaving Running tears down its IO: signal EOF to the reader
-            // and drop the handle so its connection task finishes.
+            // A slot leaving Running tears down its IO: mark tx staging dead
+            // (its mapping is about to be freed), signal EOF to the reader, and
+            // drop the handle so its connection task finishes.
             if matches!(cur, ConnState::Free | ConnState::Error) {
                 if let Some(handle) = self.handles[slot].take() {
+                    handle.clear_tx_staging();
                     handle.close_rx();
                 }
+                self.tx_set[slot] = false;
             }
 
             if let Some(ev) = ev {

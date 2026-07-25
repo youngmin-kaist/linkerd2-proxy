@@ -392,13 +392,39 @@ int32_t dmesh_doca_conn_mode_get(struct objects *objs, int32_t slot)
 	return (int32_t)objs->conns[slot].flow.mode;
 }
 
-int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
-			     const uint8_t *data, size_t len)
+/* Report the connection's mapped tx_staging region so the Rust writer can copy
+ * response bytes straight into it (write-side zero-copy). Usable length
+ * reserves a 64B tail for the backend push descriptor shadow (harmless to
+ * reserve on client channels too, keeping one rule). Negative on bad state. */
+int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot,
+				   uintptr_t *out_base, size_t *out_len)
+{
+	struct dmesh_conn *conn;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS ||
+	    out_base == NULL || out_len == NULL)
+		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
+	conn = &objs->conns[slot];
+	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->tx_staging_len <= 64)
+		return -(int32_t)DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
+
+	*out_base = (uintptr_t)conn->tx_staging;
+	*out_len = conn->tx_staging_len - 64;
+	return 0;
+}
+
+/* Publish response bytes the Rust side already wrote into tx_staging at
+ * [pos, pos+len) - NO memcpy. Returns bytes accepted (may be < len if the DMA
+ * ring/backend batch is momentarily full; the driver retries), or a negative
+ * doca_error_t. The range never crosses the staging wrap (the writer splits at
+ * the boundary and calls again). */
+int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
+				    uint32_t pos, uint32_t len)
 {
 	struct dmesh_conn *conn;
 	size_t sent = 0;
 
-	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS || data == NULL)
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 
 	conn = &objs->conns[slot];
@@ -410,7 +436,8 @@ int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
 		if (!conn->reverse_exported || conn->tx_staging == NULL)
 			return -(int32_t)DOCA_ERROR_BAD_STATE;
 		while (sent < len) {
-			int r = dmesh_dma_push_backend(conn, data + sent, len - sent);
+			int r = dmesh_dma_push_staged(conn, pos + (uint32_t)sent,
+						      len - (uint32_t)sent);
 
 			if (r < 0)
 				return sent > 0 ? (int32_t)sent : (int32_t)r;
@@ -429,37 +456,27 @@ int32_t dmesh_doca_conn_send(struct objects *objs, int32_t slot,
 		size_t chunk;
 		struct dma_desc *desc;
 
-		/* 128-align the copy (see DMESH_TX_DMA_MAXMUL): largest multiple of
-		 * 128 up to 8064, or a single <=128B sub-block for the tail. */
+		/* 128-align the descriptor (see DMESH_TX_DMA_MAXMUL): largest
+		 * multiple of 128 up to 8064, or a single <=128B sub-block for the
+		 * tail. The bytes are already in staging; we only emit descriptors. */
 		if (remaining <= 128)
 			chunk = remaining;
 		else if (remaining >= DMESH_TX_DMA_MAXMUL)
 			chunk = DMESH_TX_DMA_MAXMUL;
 		else
 			chunk = remaining & ~(size_t)127;
-		if (chunk > conn->tx_staging_len)
-			break;   /* cannot happen: chunk <= 8KB << tx_staging_len */
 
 		/* Non-blocking ring check: report a partial send rather than
 		 * busy-waiting in the driver thread if the host is behind. */
 		if (conn->rcv_ring->head - conn->rcv_ring->ctrl->consumer_head >= conn->rcv_ring->size)
 			break;
 
-		/* wrap the staging write cursor if the chunk would overrun */
-		if ((size_t)conn->tx_pos + chunk > conn->tx_staging_len)
-			conn->tx_pos = 0;
-
-		memcpy((uint8_t *)conn->tx_staging + conn->tx_pos, data + sent, chunk);
-
 		desc = get_next_dma_desc(conn->rcv_ring);
 		desc->mmap = 0;   /* kernel uses thread_arg->host_mmap as the source */
-		desc->addr = (uint64_t)conn->tx_staging + conn->tx_pos;
+		desc->addr = (uint64_t)conn->tx_staging + pos + sent;
 		desc->size = chunk;
 		commit_dma_desc(conn->rcv_ring);
 
-		conn->tx_pos += (uint32_t)chunk;
-		if (conn->tx_pos >= conn->tx_staging_len)
-			conn->tx_pos = 0;
 		sent += chunk;
 	}
 
