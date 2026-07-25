@@ -31,13 +31,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8086".to_string())
         .parse::<SocketAddr>()?;
 
-    let svc = Policy {
-        inbound: policy::all_unauthenticated(),
-        backend,
+    // MOCK_POLICY_REQUIRE_ID=<identity> serves an inbound policy that only
+    // permits mesh-TLS clients with that identity (used to exercise the fused
+    // DMA authz gate: allow when the flow's workload matches, deny otherwise).
+    let (inbound, inbound_desc) = match std::env::var("MOCK_POLICY_REQUIRE_ID") {
+        Ok(id) if !id.is_empty() => (
+            policy::all_authenticated(id.clone()),
+            format!("all-authenticated (require id={id})"),
+        ),
+        _ => (policy::all_unauthenticated(), "all-unauthenticated".to_string()),
     };
 
+    let svc = Policy { inbound, backend };
+
     eprintln!("mock policy serving on {addr}");
-    eprintln!("inbound policy: all-unauthenticated");
+    eprintln!("inbound policy: {inbound_desc}");
     eprintln!("outbound policy: forward to {backend}");
 
     Server::builder()

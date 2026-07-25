@@ -87,6 +87,8 @@ pub struct App {
     #[cfg(feature = "doca")]
     dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo>,
     #[cfg(feature = "doca")]
+    dmesh_policies: dmesh::DmeshGetPolicy,
+    #[cfg(feature = "doca")]
     dmesh_drain: drain::Watch,
 }
 
@@ -285,6 +287,15 @@ impl Config {
             );
         let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
 
+        // Inbound authorization lookup for the fused dmesh authz gate: a closure
+        // over the inbound policy client so `dmesh::serve` can enforce the
+        // destination's AuthorizationPolicy per connection.
+        #[cfg(feature = "doca")]
+        let dmesh_policies: dmesh::DmeshGetPolicy = {
+            let p = inbound_policies.clone();
+            std::sync::Arc::new(move |dst| inbound::policy::GetPolicy::get_policy(&p, dst))
+        };
+
         // Keep a drain subscriber for the dmesh acceptor (spawned post-build).
         #[cfg(feature = "doca")]
         let dmesh_drain = drain_rx.clone();
@@ -353,6 +364,8 @@ impl Config {
             #[cfg(feature = "doca")]
             dmesh_outbound,
             #[cfg(feature = "doca")]
+            dmesh_policies,
+            #[cfg(feature = "doca")]
             dmesh_drain,
         })
     }
@@ -390,9 +403,10 @@ impl App {
         registrar: dmesh_doca::Registrar,
     ) {
         let outbound = self.dmesh_outbound.clone();
+        let get_policy = self.dmesh_policies.clone();
         let shutdown = self.dmesh_drain.clone().signaled();
         tokio::spawn(
-            dmesh::serve(events, registrar, outbound, shutdown)
+            dmesh::serve(events, registrar, outbound, get_policy, shutdown)
                 .instrument(info_span!("dmesh").or_current()),
         );
     }

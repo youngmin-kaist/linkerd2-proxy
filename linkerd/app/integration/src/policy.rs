@@ -78,6 +78,50 @@ pub fn all_unauthenticated() -> inbound::Server {
     }
 }
 
+/// A server policy that permits only mesh-TLS clients whose identity matches
+/// `required_id`. Used to exercise the fused DMA authz gate: a flow whose
+/// attested workload equals `required_id` is allowed; anything else is denied.
+pub fn all_authenticated(required_id: impl ToString) -> inbound::Server {
+    inbound::Server {
+        protocol: Some(inbound::ProxyProtocol {
+            kind: Some(inbound::proxy_protocol::Kind::Detect(
+                inbound::proxy_protocol::Detect {
+                    timeout: Some(Duration::from_secs(10).try_into().unwrap()),
+                    http_routes: vec![],
+                    http_local_rate_limit: None,
+                },
+            )),
+        }),
+        authorizations: vec![inbound::Authz {
+            networks: vec![inbound::Network {
+                net: Some(ipnet::IpNet::default().into()),
+                except: Vec::new(),
+            }],
+            authentication: Some(inbound::Authn {
+                permit: Some(inbound::authn::Permit::MeshTls(inbound::authn::PermitMeshTls {
+                    clients: Some(inbound::authn::permit_mesh_tls::Clients::Identities(
+                        inbound::authn::permit_mesh_tls::PermitClientIdentities {
+                            identities: vec![inbound::Identity {
+                                name: required_id.to_string(),
+                            }],
+                            suffixes: vec![],
+                        },
+                    )),
+                })),
+            }),
+            labels: Default::default(),
+            metadata: Some(api::meta::Metadata {
+                kind: Some(api::meta::metadata::Kind::Default("all-authenticated".into())),
+            }),
+        }],
+        server_ips: vec![],
+        labels: maplit::hashmap![
+            "name".into() => "all-authenticated".into(),
+            "kind".into() => "default".into(),
+        ],
+    }
+}
+
 pub fn opaque_unauthenticated() -> inbound::Server {
     inbound::Server {
         protocol: Some(inbound::ProxyProtocol {

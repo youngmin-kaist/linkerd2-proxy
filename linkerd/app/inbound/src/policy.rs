@@ -150,7 +150,7 @@ impl AllowPolicy {
         }
     }
 
-    async fn changed(&mut self) {
+    pub async fn changed(&mut self) {
         if self.server.changed().await.is_err() {
             // If the sender was dropped, then there can be no further changes.
             futures::future::pending::<()>().await;
@@ -166,6 +166,40 @@ impl AllowPolicy {
             Protocol::Grpc(grpc) => Some(Routes::Grpc(grpc.clone())),
             _ => None,
         }
+    }
+}
+
+/// Connection-level authorization for the fused DMA (dmesh) path.
+///
+/// The dmesh fused stack applies the destination's inbound authorization once
+/// per connection: there is no mTLS handshake, so the source workload identity
+/// is carried in `tls` as a pre-attested peer (see `DmeshTarget`). This reuses
+/// the exact per-authorization decision of the normal inbound path
+/// ([`is_authorized`]). For HTTP/gRPC services, whose authorizations are
+/// per-route, a connection is permitted if the client is authorized by ANY
+/// route rule — sufficient for a Server-scoped `AuthorizationPolicy` where all
+/// routes share the default authorization. Returns true if `client`/`tls` may
+/// reach the server behind `policy`.
+pub fn dmesh_connection_authorized(
+    policy: &AllowPolicy,
+    client_addr: Remote<ClientAddr>,
+    tls: &tls::ConditionalServerTls,
+) -> bool {
+    let server = policy.borrow();
+    let any = |authzs: &[Authorization]| authzs.iter().any(|a| is_authorized(a, client_addr, tls));
+    match &server.protocol {
+        Protocol::Detect {
+            tcp_authorizations, ..
+        } => any(tcp_authorizations),
+        Protocol::Opaque(authzs) | Protocol::Tls(authzs) => any(authzs),
+        Protocol::Http1(routes) | Protocol::Http2(routes) => routes
+            .iter()
+            .flat_map(|r| r.rules.iter())
+            .any(|rule| any(&rule.policy.authorizations)),
+        Protocol::Grpc(routes) => routes
+            .iter()
+            .flat_map(|r| r.rules.iter())
+            .any(|rule| any(&rule.policy.authorizations)),
     }
 }
 
