@@ -5,12 +5,7 @@ authors = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 publish = { workspace = true }
-description = "Small DOCA initialization wrapper for linkerd2-proxy"
-
-[features]
-default = ["own-datapath"]
-# Compile the bundled C datapath and DOCA owner.
-own-datapath = []
+description = "External-datapath endpoint and acceptor support for linkerd2-proxy"
 
 [dependencies]
 tracing = { workspace = true }
@@ -22,7 +17,3 @@ tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros", "io-util"] }
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"

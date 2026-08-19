@@ -41,45 +41,6 @@ fn main() {
 
     linkerd_rustls::install_default_provider();
 
-    // Stage 1 (synchronous, pre-runtime): open the DOCA device and start the
-    // dmesh comch server. The async driver is spawned inside the runtime below.
-    #[cfg(feature = "doca")]
-    let dmesh_doca = {
-        match dmesh_doca::initialize() {
-            Ok(report) => info!("{}", report.log_summary()),
-            Err(error) => {
-                eprintln!("DOCA initialization failure: {error}");
-                std::process::exit(1);
-            }
-        }
-        let dev_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_DEV_PCI_ADDR") {
-            Ok(addr) => addr,
-            Err(error) => {
-                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}");
-                std::process::exit(EX_USAGE);
-            }
-        };
-        let rep_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_REP_PCI_ADDR") {
-            Ok(addr) => addr,
-            Err(error) => {
-                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}");
-                std::process::exit(EX_USAGE);
-            }
-        };
-        let server_name = std::env::var("LINKERD2_PROXY_DOCA_SERVER_NAME")
-            .unwrap_or_else(|_| "DPUMesh0".to_string());
-        match dmesh_doca::DmeshDoca::initialize(&dev_pci_addr, &rep_pci_addr, &server_name) {
-            Ok(doca_handle) => {
-                info!(server = %server_name, "dmesh comch server started");
-                doca_handle
-            }
-            Err(error) => {
-                eprintln!("DOCA comch initialization failure: {error}");
-                std::process::exit(1);
-            }
-        }
-    };
-
     let mut metrics = linkerd_metrics::prom::Registry::default();
 
     // Load configuration from the environment without binding ports.
@@ -97,23 +58,6 @@ fn main() {
     rt::build().block_on(async move {
         // Spawn a task to run in the background, exporting runtime metrics at a regular interval.
         rt::spawn_metrics_exporter(&mut metrics);
-
-        // Stage 2: drive the dmesh control/data paths event-driven (AsyncFd on
-        // the DOCA progress-engine fds). The event stream + registrar are handed
-        // to the app's dmesh acceptor (spawned after the app is built) so
-        // DMA-received connections flow through the real outbound stack.
-        #[cfg(feature = "doca")]
-        let dmesh_acceptor = {
-            let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
-            let (driver, registrar) = dmesh_doca::Driver::new(dmesh_doca, dmesh_tx);
-            tokio::spawn(async move {
-                match driver.run().await {
-                    Ok(()) => warn!("dmesh driver exited"),
-                    Err(error) => warn!(%error, "dmesh driver failed"),
-                }
-            });
-            (dmesh_rx, registrar)
-        };
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         let shutdown_grace_period = config.shutdown_grace_period;
@@ -137,13 +81,6 @@ fn main() {
                 std::process::exit(1);
             }
         };
-
-        // Drive DMA-received connections through the outbound stack.
-        #[cfg(feature = "doca")]
-        {
-            let (dmesh_rx, registrar) = dmesh_acceptor;
-            app.spawn_dmesh(dmesh_rx, registrar);
-        }
 
         info!("Admin interface on {}", app.admin_addr());
         info!("Inbound interface on {}", app.inbound_addr());

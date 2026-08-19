@@ -18,7 +18,7 @@ log-streaming = ["linkerd-app-admin/log-streaming"]
 pprof = ["linkerd-app-admin/pprof"]
 
 [dependencies]
-dmesh-doca = { path = "../doca", optional = true, default-features = false }
+dmesh-doca = { path = "../doca", optional = true }
 futures = { version = "0.3", default-features = false }
 hyper-util = { workspace = true }
 linkerd-app-admin = { path = "./admin" }

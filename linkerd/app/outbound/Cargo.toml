@@ -20,7 +20,7 @@ prometheus-client-rust-242 = [] # TODO
 
 [dependencies]
 ahash = "0.8"
-dmesh-doca = { path = "../../doca", optional = true, default-features = false }
+dmesh-doca = { path = "../../doca", optional = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true, optional = true }
@@ -44,7 +44,7 @@ linkerd-http-prom = { path = "../../http/prom" }
 linkerd-http-retry = { path = "../../http/retry" }
 linkerd-http-route = { path = "../../http/route" }
 linkerd-identity = { path = "../../identity" }
-linkerd-meshtls = { path = "../../meshtls", optional = true, default-features = false }
+linkerd-meshtls = { path = "../../meshtls", optional = true }
 linkerd-opaq-route = { path = "../../opaq-route" }
 linkerd-proxy-client-policy = { path = "../../proxy/client-policy", features = [
     "proto",

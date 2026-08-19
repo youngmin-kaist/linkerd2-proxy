@@ -8,9 +8,8 @@ publish = { workspace = true }
 description = "The main proxy executable"
 
 [features]
-default = ["allow-loopback", "doca"]
+default = ["allow-loopback"]
 allow-loopback = ["linkerd-app/allow-loopback"]
-doca = ["dmesh-doca", "linkerd-app/doca"]
 meshtls-rustls-aws-lc-fips = ["linkerd-rustls/rustls-aws-lc-fips"]
 log-streaming = ["linkerd-app/log-streaming"]
 pprof = ["linkerd-app/pprof"]
@@ -24,7 +23,6 @@ jemalloc-profiling = [
 futures = { version = "0.3", default-features = false }
 kubert-prometheus-tokio = { version = "0.2.0", features = ["rt"] }
 linkerd-app = { path = "../linkerd/app" }
-dmesh-doca = { path = "../linkerd/doca", optional = true }
 linkerd-metrics = { path = "../linkerd/metrics" }
 linkerd-rustls = { path = "../linkerd/rustls" }
 linkerd-signal = { path = "../linkerd/signal" }
