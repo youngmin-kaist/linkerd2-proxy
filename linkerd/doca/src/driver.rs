@@ -16,6 +16,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::mpsc;
 
+use crate::api::{DmeshEvent, FlowId, Registrar, Registration, SessionToken, MAX_CONNS};
 use crate::{DmeshDoca, Error};
 
 extern "C" {
@@ -69,22 +70,12 @@ extern "C" {
     ) -> c_int;
     // Used once staging-buffer flow control lands (read watermark -> DPA).
     #[allow(dead_code)]
-    fn dmesh_doca_conn_recv_release(
-        objs: *mut c_void,
-        slot: i32,
-        pos: u32,
-        len: u32,
-    ) -> c_int;
+    fn dmesh_doca_conn_recv_release(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> c_int;
     // Flow mode of a slot: 0 = client, 1 = backend provider.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Reverse path: queue response bytes for DMA back to the host. Returns the
     // number of bytes accepted (>=0) or a negative doca_error_t.
-    fn dmesh_doca_conn_send(
-        objs: *mut c_void,
-        slot: i32,
-        data: *const u8,
-        len: usize,
-    ) -> i32;
+    fn dmesh_doca_conn_send(objs: *mut c_void, slot: i32, data: *const u8, len: usize) -> i32;
 }
 
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
@@ -114,49 +105,6 @@ impl ConnState {
         }
     }
 }
-
-/// Identity of the flow carried by a dmesh connection, conveyed explicitly in
-/// the host's metadata message because the DMA path has no TCP/IP headers.
-/// `dst` is the ORIGINAL destination (what iptables interception used to
-/// recover via SO_ORIGINAL_DST) and is the outbound routing key; `src` stands
-/// in for the peer address a TCP accept would have provided.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FlowId {
-    pub src: std::net::SocketAddrV4,
-    pub dst: std::net::SocketAddrV4,
-    /// Source workload identity (pod / service-account) for policy & telemetry.
-    pub workload: String,
-    /// True for a BACKEND-mode connection: the host end provides the service
-    /// at `dst`; the connector reaches it through this channel instead of TCP.
-    pub is_backend: bool,
-}
-
-/// Events emitted by the driver as the shared state machine progresses.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DmeshEvent {
-    /// Shared infrastructure (DPA pool, consumer PE) is up; serving connections.
-    InfraReady,
-    /// The connection in this slot completed setup and its DPA thread is
-    /// running; the flow identity came from the host's metadata message.
-    ConnReady(usize, FlowId),
-    /// The connection in this slot was unbound (host disconnected).
-    ConnClosed(usize),
-    /// Setup of the connection in this slot failed; the slot is parked.
-    ConnError(usize),
-    /// Periodic datapath report (deltas over `elapsed_ms`, emitted only when
-    /// traffic flowed). Rates: msgs/s = recv_msgs * 1000 / elapsed_ms.
-    Stats {
-        elapsed_ms: u64,
-        recv_msgs: i64,
-        recv_bytes: i64,
-        sent_msgs: i64,
-        dma_pending: i64,
-        dma_dropped: i64,
-    },
-}
-
-/// Max connection slots per driver (mirrors DMESH_MAX_CONNECTIONS).
-pub const MAX_CONNS: usize = 8;
 
 /// Max consumer-PE events drained per loop iteration, matching the C worker's
 /// DATA_DRAIN_BUDGET: bounds each wakeup so the control path cannot starve.
@@ -188,23 +136,17 @@ pub struct Stats {
 /// All FFI calls go through `&mut self`, so the underlying `struct objects`
 /// (and its non-thread-safe progress engines) is only ever touched by the one
 /// task that owns the `Driver`.
-/// Registration message from the acceptor: bind a per-connection IO handle to
-/// a slot so the driver can pump recv segments into it and pick up its writes.
-pub type Registration = (usize, crate::DmeshIoHandle);
-/// Sender the acceptor uses to register connection handles with the driver.
-pub type Registrar = mpsc::UnboundedSender<Registration>;
-
 pub struct Driver {
     doca: DmeshDoca,
     events: mpsc::UnboundedSender<DmeshEvent>,
     reg_rx: mpsc::UnboundedReceiver<Registration>,
     conn_states: [ConnState; MAX_CONNS],
     handles: [Option<crate::DmeshIoHandle>; MAX_CONNS],
-    // DPU-internal latency probe: t_in set when a forward segment is delivered,
-    // measured when the response leaves via pump_send. (linkerd + backend time.)
-    t_in: Option<std::time::Instant>,
-    dpu_sum_us: u64,
-    dpu_cnt: u64,
+    /// Token of the session each slot currently carries.
+    tokens: [Option<SessionToken>; MAX_CONNS],
+    /// Times each slot has been handed out. Never reset; a slot that runs out
+    /// of generations is retired.
+    generations: [u32; MAX_CONNS],
 }
 
 // SAFETY: the raw DOCA handle is only dereferenced through &mut self, and a
@@ -227,23 +169,29 @@ impl Driver {
         debug_assert_eq!(unsafe { dmesh_doca_max_conns() } as usize, MAX_CONNS);
         let (reg_tx, reg_rx) = mpsc::unbounded_channel();
         const NONE: Option<crate::DmeshIoHandle> = None;
+        const NO_TOKEN: Option<SessionToken> = None;
         let driver = Self {
             doca,
             events,
             reg_rx,
             conn_states: [ConnState::Free; MAX_CONNS],
             handles: [NONE; MAX_CONNS],
-            t_in: None,
-            dpu_sum_us: 0,
-            dpu_cnt: 0,
+            tokens: [NO_TOKEN; MAX_CONNS],
+            generations: [0; MAX_CONNS],
         };
         (driver, reg_tx)
     }
 
     /// Install any pending IO handles, wiring each to its slot's staging region.
+    ///
+    /// A registration whose token is not the slot's live one belongs to a
+    /// session that has already closed: abort it rather than binding a new
+    /// connection to an endpoint the old stack task still holds.
     fn drain_registrations(&mut self) {
-        while let Ok((slot, handle)) = self.reg_rx.try_recv() {
-            if slot >= MAX_CONNS {
+        while let Ok(Registration { token, handle }) = self.reg_rx.try_recv() {
+            let slot = token.slot as usize;
+            if slot >= MAX_CONNS || self.tokens[slot] != Some(token) {
+                handle.abort();
                 continue;
             }
             let mut base: *const u8 = std::ptr::null();
@@ -273,9 +221,6 @@ impl Driver {
                 if rc != 0 {
                     break; // DOCA_ERROR_EMPTY or error
                 }
-                if self.t_in.is_none() {
-                    self.t_in = Some(std::time::Instant::now());
-                }
                 handle.push_segment(pos, len);
             }
         }
@@ -304,19 +249,6 @@ impl Driver {
                     break;
                 }
                 let sent = rc as usize;
-                if sent > 0 {
-                    if let Some(t) = self.t_in.take() {
-                        self.dpu_sum_us += t.elapsed().as_micros() as u64;
-                        self.dpu_cnt += 1;
-                        if self.dpu_cnt % 200 == 0 {
-                            eprintln!(
-                                "[dmesh-lat] DPU-internal (fwd-arrive -> resp-send) mean {} us over {}",
-                                self.dpu_sum_us / self.dpu_cnt,
-                                self.dpu_cnt
-                            );
-                        }
-                    }
-                }
                 if sent < buf.len() {
                     // ring momentarily full: return the remainder, retry next tick
                     handle.untake_tx(&buf[sent..]);
@@ -388,14 +320,26 @@ impl Driver {
         // inet_addr() stores the address bytes in network order in memory;
         // both PCIe endpoints are little-endian, so the raw u32's LE bytes
         // are exactly the network-order octets.
-        let is_backend =
-            unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
+        let is_backend = unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
         FlowId {
             src: std::net::SocketAddrV4::new(src_ip.to_le_bytes().into(), src_port),
             dst: std::net::SocketAddrV4::new(dst_ip.to_le_bytes().into(), dst_port),
             workload,
             is_backend,
         }
+    }
+
+    /// Name the session a slot is now carrying. A slot whose generations are
+    /// exhausted is retired: no token is issued twice.
+    fn open_slot(&mut self, slot: usize) -> Option<SessionToken> {
+        let generation = self.generations[slot];
+        if generation == u32::MAX {
+            return None;
+        }
+        self.generations[slot] = generation + 1;
+        let token = SessionToken::new(0, slot as u32, generation);
+        self.tokens[slot] = Some(token);
+        Some(token)
     }
 
     fn advance(&mut self) -> Result<c_int, Error> {
@@ -421,18 +365,24 @@ impl Driver {
             self.conn_states[slot] = cur;
 
             let ev = match cur {
-                ConnState::Running => Some(DmeshEvent::ConnReady(slot, self.conn_flow(slot))),
-                ConnState::Error => Some(DmeshEvent::ConnError(slot)),
-                ConnState::Free if prev != ConnState::Free => Some(DmeshEvent::ConnClosed(slot)),
+                ConnState::Running => self.open_slot(slot).map(|token| {
+                    let flow = self.conn_flow(slot);
+                    DmeshEvent::ConnReady(token, flow)
+                }),
+                ConnState::Error => self.tokens[slot].map(DmeshEvent::ConnError),
+                ConnState::Free if prev != ConnState::Free => {
+                    self.tokens[slot].map(DmeshEvent::ConnClosed)
+                }
                 _ => None, // New / ConsumerStarting / AwaitMetadata are internal setup states
             };
 
-            // A slot leaving Running tears down its IO: signal EOF to the reader
-            // and drop the handle so its connection task finishes.
+            // A slot leaving Running no longer owns its staging. Discard queued
+            // references and wake both halves before dropping the handle.
             if matches!(cur, ConnState::Free | ConnState::Error) {
                 if let Some(handle) = self.handles[slot].take() {
-                    handle.close_rx();
+                    handle.abort();
                 }
+                self.tokens[slot] = None;
             }
 
             if let Some(ev) = ev {

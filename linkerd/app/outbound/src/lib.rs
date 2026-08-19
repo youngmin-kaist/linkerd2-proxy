@@ -83,6 +83,21 @@ pub struct Config {
 
     // Whether the proxy may include informational headers on HTTP responses.
     pub emit_headers: bool,
+
+    /// The DMesh backend registry and counters of the ARM worker this stack
+    /// belongs to. `None` in a stock proxy, where every connection is dialed
+    /// over TCP.
+    #[cfg(feature = "doca")]
+    pub dmesh: Option<dmesh_doca::Dmesh>,
+
+    /// Binds a DMesh-only outbound stack to exactly one frontend session.
+    ///
+    /// The normal socket listener leaves this unset. The DMA acceptor builds a
+    /// fresh outbound stack for each session and sets it before the stack is
+    /// constructed, so every transport/reconnect cache in that stack is
+    /// session-local without changing stock TCP cache keys.
+    #[cfg(feature = "doca")]
+    pub dmesh_session: Option<dmesh_doca::SessionToken>,
 }
 
 #[derive(Clone, Debug)]

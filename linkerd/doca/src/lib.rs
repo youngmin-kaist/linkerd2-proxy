@@ -1,3 +1,4 @@
+#[cfg(feature = "own-datapath")]
 use std::{
     ffi::{CStr, CString, NulError},
     fmt,
@@ -5,49 +6,33 @@ use std::{
     ptr::NonNull,
 };
 
+mod api;
+mod backend;
+#[cfg(feature = "own-datapath")]
 mod driver;
 mod io;
+mod metrics;
+pub mod runtime;
 
-pub use driver::{
-    ConnState, DmeshEvent, Driver, FlowId, Registrar, Registration, Stats, MAX_CONNS,
-};
-pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
+pub use api::{DmeshEvent, FlowId, Registrar, Registration, SessionToken, Slots, MAX_CONNS};
+pub use backend::{BackendKey, Backends, PublishError, TakeError};
 
-/// Registry of DMA backend channels: a BACKEND-mode host connection provides a
-/// service at some address, and the outbound connector takes the DmeshIo from
-/// here instead of dialing TCP. One channel per address; `take` hands the
-/// (long-lived, h2-multiplexed) connection out once.
-pub mod backend {
-    use crate::DmeshIo;
-    use std::{
-        collections::HashMap,
-        net::SocketAddr,
-        sync::{Mutex, OnceLock},
-    };
-
-    fn reg() -> &'static Mutex<HashMap<SocketAddr, DmeshIo>> {
-        static R: OnceLock<Mutex<HashMap<SocketAddr, DmeshIo>>> = OnceLock::new();
-        R.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    pub fn publish(addr: SocketAddr, io: DmeshIo) {
-        tracing::info!(%addr, "dmesh backend channel published");
-        reg().lock().unwrap().insert(addr, io);
-    }
-
-    pub fn take(addr: &SocketAddr) -> Option<DmeshIo> {
-        let io = reg().lock().unwrap().remove(addr);
-        if io.is_some() {
-            tracing::info!(%addr, "dmesh backend channel taken by connector");
-        }
-        io
-    }
-
-    pub fn contains(addr: &SocketAddr) -> bool {
-        reg().lock().unwrap().contains_key(addr)
-    }
+/// What one ARM worker's DMesh-specific outbound stack is wired to.
+///
+/// Held by the worker's connector, acceptor and adapter; two workers never
+/// share one.
+#[derive(Clone, Debug)]
+pub struct Dmesh {
+    pub backends: std::sync::Arc<Backends>,
+    pub metrics: std::sync::Arc<SessionMetrics>,
 }
 
+#[cfg(feature = "own-datapath")]
+pub use driver::{ConnState, Driver, Stats};
+pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle, DrainState};
+pub use metrics::{record_control_event, SessionMetrics};
+
+#[cfg(feature = "own-datapath")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawProbeReport {
@@ -64,6 +49,7 @@ struct RawProbeReport {
     first_device_pci: [c_char; 64],
 }
 
+#[cfg(feature = "own-datapath")]
 extern "C" {
     fn dmesh_doca_probe(report: *mut RawProbeReport) -> c_int;
     fn dmesh_doca_error_name(error: c_int) -> *const c_char;
@@ -77,6 +63,7 @@ extern "C" {
     fn dmesh_doca_comch_destroy(handle: *mut c_void);
 }
 
+#[cfg(feature = "own-datapath")]
 #[derive(Clone, Debug)]
 pub struct ProbeReport {
     pub compile_version: String,
@@ -89,6 +76,7 @@ pub struct ProbeReport {
     pub dpa: LibraryStatus,
 }
 
+#[cfg(feature = "own-datapath")]
 #[derive(Clone, Debug)]
 pub struct LibraryStatus {
     code: c_int,
@@ -96,6 +84,7 @@ pub struct LibraryStatus {
     description: String,
 }
 
+#[cfg(feature = "own-datapath")]
 #[derive(Clone, Debug)]
 pub struct Error {
     code: c_int,
@@ -103,12 +92,14 @@ pub struct Error {
     description: String,
 }
 
+#[cfg(feature = "own-datapath")]
 #[derive(Debug)]
 // pub struct DocaComch {
 pub struct DmeshDoca {
     handle: NonNull<c_void>,
 }
 
+#[cfg(feature = "own-datapath")]
 pub fn initialize() -> Result<ProbeReport, Error> {
     let mut raw = RawProbeReport {
         device_count: 0,
@@ -141,8 +132,12 @@ pub fn initialize() -> Result<ProbeReport, Error> {
     })
 }
 
+#[cfg(feature = "own-datapath")]
 impl DmeshDoca {
-    pub fn initialize(dev_pci_addr: &str, rep_pci_addr: &str,server_name: &str,
+    pub fn initialize(
+        dev_pci_addr: &str,
+        rep_pci_addr: &str,
+        server_name: &str,
     ) -> Result<Self, Error> {
         let dev_pci_addr = CString::new(dev_pci_addr)?;
         let rep_pci_addr = CString::new(rep_pci_addr)?;
@@ -158,7 +153,10 @@ impl DmeshDoca {
             )
         };
         if status != 0 {
-            println!("Failed to initialize DOCA comch server and datapath consumer: {}", Error::from_code(status));
+            println!(
+                "Failed to initialize DOCA comch server and datapath consumer: {}",
+                Error::from_code(status)
+            );
             return Err(Error::from_code(status));
         }
 
@@ -172,12 +170,14 @@ impl DmeshDoca {
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl Error {
     pub(crate) fn from_doca(code: c_int) -> Self {
         Self::from_code(code)
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl ProbeReport {
     pub fn log_summary(&self) -> String {
         format!(
@@ -194,6 +194,7 @@ impl ProbeReport {
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl LibraryStatus {
     pub fn is_supported(&self) -> bool {
         self.code == 0
@@ -208,6 +209,7 @@ impl LibraryStatus {
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl Error {
     fn from_code(code: c_int) -> Self {
         Self {
@@ -226,18 +228,21 @@ impl Error {
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl Drop for DmeshDoca {
     fn drop(&mut self) {
         unsafe { dmesh_doca_comch_destroy(self.handle.as_ptr()) };
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl From<NulError> for Error {
     fn from(error: NulError) -> Self {
         Self::new(-1, error.to_string())
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl fmt::Display for LibraryStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_supported() {
@@ -248,28 +253,34 @@ impl fmt::Display for LibraryStatus {
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} [{}] ({})", self.name, self.code, self.description)
     }
 }
 
+#[cfg(feature = "own-datapath")]
 impl std::error::Error for Error {}
 
+#[cfg(feature = "own-datapath")]
 fn error_name(code: c_int) -> String {
     unsafe { c_ptr_to_string(dmesh_doca_error_name(code)) }
 }
 
+#[cfg(feature = "own-datapath")]
 fn error_description(code: c_int) -> String {
     unsafe { c_ptr_to_string(dmesh_doca_error_descr(code)) }
 }
 
+#[cfg(feature = "own-datapath")]
 fn c_array_to_string<const N: usize>(array: &[c_char; N]) -> String {
     unsafe { CStr::from_ptr(array.as_ptr()) }
         .to_string_lossy()
         .into_owned()
 }
 
+#[cfg(feature = "own-datapath")]
 unsafe fn c_ptr_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return "<null>".to_string();

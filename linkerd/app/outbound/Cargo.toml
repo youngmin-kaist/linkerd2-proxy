@@ -20,7 +20,7 @@ prometheus-client-rust-242 = [] # TODO
 
 [dependencies]
 ahash = "0.8"
-dmesh-doca = { path = "../../doca", optional = true }
+dmesh-doca = { path = "../../doca", optional = true, default-features = false }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true, optional = true }

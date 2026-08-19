@@ -578,7 +578,9 @@ dependencies = [
  "async-trait",
  "cc",
  "linkerd-io",
+ "parking_lot",
  "pkg-config",
+ "prometheus-client",
  "tokio",
  "tracing",
 ]

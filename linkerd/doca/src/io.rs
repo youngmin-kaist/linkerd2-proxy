@@ -19,14 +19,26 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use linkerd_io::{Peek, PeerAddr};
+use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Default cap on buffered-but-unsent bytes before writers see backpressure.
 const DEFAULT_TX_CAPACITY: usize = 256 * 1024;
+
+/// How large the consumed prefix of `tx` may grow before it is reclaimed. One
+/// publication consumes at most an egress chunk, so a smaller bound would move
+/// the queue tail on nearly every publication, which is the copy the cursor
+/// exists to avoid.
+const TX_COMPACT_THRESHOLD: usize = 64 * 1024;
+
+/// Every `DmeshIo`/`DmeshIoHandle` operation takes the same per-connection lock.
+fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    inner.lock()
+}
 
 #[derive(Default)]
 struct Inner {
@@ -45,8 +57,12 @@ struct Inner {
     rx_closed: bool,
     rx_waker: Option<Waker>,
 
-    /// Bytes written by the stack, awaiting pickup by the driver.
+    /// Bytes written by the stack, awaiting pickup by the driver. The queue is
+    /// `tx[tx_read..]`; everything before the cursor has been published, and
+    /// that prefix is reclaimed in one move once it reaches
+    /// `TX_COMPACT_THRESHOLD`.
     tx: Vec<u8>,
+    tx_read: usize,
     /// Local half shut down: further writes fail.
     tx_closed: bool,
     tx_waker: Option<Waker>,
@@ -75,6 +91,33 @@ impl Inner {
     fn rx_has_data(&self) -> bool {
         !self.rx.is_empty() || !self.segs.is_empty()
     }
+
+    /// Output the driver has not published yet.
+    fn tx_pending(&self) -> &[u8] {
+        &self.tx[self.tx_read..]
+    }
+
+    fn tx_queued(&self) -> usize {
+        self.tx.len() - self.tx_read
+    }
+
+    /// Advance the cursor over `n` published bytes and reclaim the prefix once
+    /// it is worth moving what is left.
+    fn tx_consume(&mut self, n: usize) {
+        self.tx_read += n;
+        if self.tx_read == self.tx.len() {
+            self.tx.clear();
+            self.tx_read = 0;
+        } else if self.tx_read >= TX_COMPACT_THRESHOLD {
+            self.tx.drain(..self.tx_read);
+            self.tx_read = 0;
+        }
+    }
+
+    fn tx_clear(&mut self) {
+        self.tx.clear();
+        self.tx_read = 0;
+    }
 }
 
 /// Stack-facing endpoint (the `TcpStream` analogue).
@@ -86,6 +129,15 @@ pub struct DmeshIo {
 /// Driver-facing endpoint bridging the DMA staging buffer to the stack.
 pub struct DmeshIoHandle {
     inner: Arc<Mutex<Inner>>,
+}
+
+/// What one drain pass observes about an endpoint after publishing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainState {
+    /// The reader still holds undelivered or undrained input.
+    pub has_rx: bool,
+    /// The stack shut its write half and every queued byte has been published.
+    pub tx_finished: bool,
 }
 
 // SAFETY: `staging_base` is a raw address into a DMA region that outlives the
@@ -127,7 +179,7 @@ impl AsyncRead for DmeshIo {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
 
         // Owned bytes first (copy path).
         if !inner.rx.is_empty() {
@@ -172,14 +224,14 @@ impl AsyncWrite for DmeshIo {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         if inner.tx_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "dmesh connection is shut down",
             )));
         }
-        let room = inner.tx_capacity.saturating_sub(inner.tx.len());
+        let room = inner.tx_capacity.saturating_sub(inner.tx_queued());
         if room == 0 {
             inner.tx_waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -196,7 +248,7 @@ impl AsyncWrite for DmeshIo {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.tx_closed = true;
         inner.wake_driver();
         Poll::Ready(Ok(()))
@@ -220,7 +272,7 @@ impl PeerAddr for DmeshIo {
 
 impl Drop for DmeshIo {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.tx_closed = true;
         inner.wake_driver();
     }
@@ -230,7 +282,7 @@ impl DmeshIoHandle {
     /// Point the reader at the connection's mapped DMA staging region. Must be
     /// set before any `push_segment`.
     pub fn set_staging(&self, base_addr: usize, len: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.staging_base = base_addr;
         inner.staging_len = len;
     }
@@ -238,30 +290,81 @@ impl DmeshIoHandle {
     /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
     /// to the reading stack (zero-copy: no bytes are moved here).
     pub fn push_segment(&self, pos: u32, len: u32) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.segs.push_back((pos, len));
         inner.wake_reader();
     }
 
     /// Deliver owned bytes to the reading stack (copy path; tests / non-DMA).
     pub fn push_rx(&self, bytes: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.rx.extend_from_slice(bytes);
         inner.wake_reader();
     }
 
     /// Signal peer half-close: pending data drains, then reads return EOF.
     pub fn close_rx(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock(&self.inner);
         inner.rx_closed = true;
         inner.wake_reader();
     }
 
+    /// Abort both halves and discard all buffered data.
+    ///
+    /// The driver must call this before returning custody for unread DMA
+    /// segments. Once this returns, no stack task can retain a reference to a
+    /// queued staging segment or enqueue more output.
+    pub fn abort(&self) {
+        let mut inner = lock(&self.inner);
+        inner.rx.clear();
+        inner.segs.clear();
+        inner.seg_read_off = 0;
+        inner.staging_base = 0;
+        inner.staging_len = 0;
+        inner.rx_closed = true;
+        inner.tx_clear();
+        inner.tx_closed = true;
+        inner.wake_reader();
+        inner.wake_writer();
+        inner.wake_driver();
+    }
+
+    /// Copy up to `out.len()` queued output bytes into `out` without consuming
+    /// them, and answer how many were copied.
+    ///
+    /// This is the reservation path's read: the caller copies straight into the
+    /// egress arena and consumes only the prefix the datapath accepted, so a
+    /// refused reservation leaves the queue exactly as it was.
+    pub fn copy_tx_into(&self, out: &mut [u8]) -> usize {
+        let inner = lock(&self.inner);
+        let pending = inner.tx_pending();
+        let n = pending.len().min(out.len());
+        out[..n].copy_from_slice(&pending[..n]);
+        n
+    }
+
+    /// Drop the first `n` output bytes, which the datapath has accepted.
+    pub fn consume_tx(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut inner = lock(&self.inner);
+        let n = n.min(inner.tx_queued());
+        inner.tx_consume(n);
+        inner.wake_writer();
+    }
+
+    /// Queued output bytes.
+    pub fn tx_len(&self) -> usize {
+        lock(&self.inner).tx_queued()
+    }
+
     /// Take up to `max` bytes written by the stack (to post as DMA sends).
     pub fn take_tx(&self, max: usize) -> Vec<u8> {
-        let mut inner = self.inner.lock().unwrap();
-        let n = inner.tx.len().min(max);
-        let out: Vec<u8> = inner.tx.drain(..n).collect();
+        let mut inner = lock(&self.inner);
+        let n = inner.tx_queued().min(max);
+        let out = inner.tx_pending()[..n].to_vec();
+        inner.tx_consume(n);
         if n > 0 {
             inner.wake_writer();
         }
@@ -274,28 +377,48 @@ impl DmeshIoHandle {
         if data.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        let mut merged = Vec::with_capacity(data.len() + inner.tx.len());
+        let mut inner = lock(&self.inner);
+        // The bytes came off the front of this queue, so the room they left is
+        // still in front of the cursor unless it was reclaimed meanwhile.
+        if data.len() <= inner.tx_read {
+            let at = inner.tx_read - data.len();
+            let end = inner.tx_read;
+            inner.tx[at..end].copy_from_slice(data);
+            inner.tx_read = at;
+            return;
+        }
+        let mut merged = Vec::with_capacity(data.len() + inner.tx_queued());
         merged.extend_from_slice(data);
-        merged.append(&mut inner.tx);
+        merged.extend_from_slice(inner.tx_pending());
         inner.tx = merged;
+        inner.tx_read = 0;
     }
 
     /// True once the stack shut down its write half and tx is fully drained.
     pub fn tx_finished(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.tx_closed && inner.tx.is_empty()
+        let inner = lock(&self.inner);
+        inner.tx_closed && inner.tx_queued() == 0
     }
 
     /// True while the reader still has undelivered/undrained data.
     pub fn has_rx(&self) -> bool {
-        self.inner.lock().unwrap().rx_has_data()
+        lock(&self.inner).rx_has_data()
     }
 
-    /// Poll-style wait for new tx bytes (or shutdown); used by the driver.
+    /// Both answers a drain pass needs about an endpoint once it has published,
+    /// under one lock: a pass asks them together and they are read together.
+    pub fn drain_state(&self) -> DrainState {
+        let inner = lock(&self.inner);
+        DrainState {
+            has_rx: inner.rx_has_data(),
+            tx_finished: inner.tx_closed && inner.tx_queued() == 0,
+        }
+    }
+
+    /// Poll for bytes waiting in the tx queue.
     pub fn poll_tx_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.tx.is_empty() || inner.tx_closed {
+        let mut inner = lock(&self.inner);
+        if inner.tx_queued() > 0 {
             return Poll::Ready(());
         }
         inner.driver_waker = Some(cx.waker().clone());
@@ -341,10 +464,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abort_discards_buffers_and_closes_both_halves() {
+        let (mut io, handle) = pair();
+        handle.push_rx(b"unread");
+        io.write_all(b"unsent").await.unwrap();
+
+        handle.abort();
+
+        let mut buf = [0u8; 8];
+        assert_eq!(io.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(
+            io.write_all(b"late").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(handle.take_tx(usize::MAX).is_empty());
+        assert!(handle.tx_finished());
+    }
+
+    #[tokio::test]
     async fn zero_copy_staging_read() {
         // Simulate a staging region: a leaked buffer the driver "DMA'd" into.
         let staging: &'static [u8] = Box::leak(
-            b"....GET / HTTP/1.1\r\n\r\nXXXX".to_vec().into_boxed_slice(),
+            b"....GET / HTTP/1.1\r\n\r\nXXXX"
+                .to_vec()
+                .into_boxed_slice(),
         );
         let (mut io, handle) = pair();
         handle.set_staging(staging.as_ptr() as usize, staging.len());
@@ -362,6 +505,67 @@ mod tests {
     async fn peer_addr_reports_flow_src() {
         let (io, _h) = pair();
         assert_eq!(io.peer_addr().unwrap(), "127.0.0.1:40000".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn copy_tx_leaves_the_queue_until_it_is_consumed() {
+        let (mut io, handle) = pair();
+        io.write_all(b"0123456789").await.unwrap();
+
+        let mut out = [0u8; 4];
+        assert_eq!(handle.copy_tx_into(&mut out), 4);
+        assert_eq!(&out, b"0123");
+        // A refused reservation consumes nothing.
+        handle.consume_tx(0);
+        assert_eq!(handle.tx_len(), 10);
+
+        handle.consume_tx(4);
+        assert_eq!(handle.tx_len(), 6);
+        let mut rest = [0u8; 16];
+        assert_eq!(handle.copy_tx_into(&mut rest), 6);
+        assert_eq!(&rest[..6], b"456789");
+
+        handle.consume_tx(usize::MAX);
+        assert_eq!(handle.tx_len(), 0);
+        assert_eq!(handle.copy_tx_into(&mut rest), 0);
+    }
+
+    #[tokio::test]
+    async fn a_requeued_suffix_returns_to_the_front_in_order() {
+        let (mut io, handle) = pair();
+        io.write_all(b"0123456789").await.unwrap();
+
+        let taken = handle.take_tx(6);
+        assert_eq!(taken, b"012345");
+        // The datapath accepted only "012"; the rest goes back ahead of "6789".
+        handle.untake_tx(&taken[3..]);
+        assert_eq!(handle.tx_len(), 7);
+        assert_eq!(handle.take_tx(usize::MAX), b"3456789");
+        assert_eq!(handle.tx_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_consumed_prefix_does_not_count_against_capacity() {
+        let (mut io, handle) = pair();
+        // Fill the queue, then publish more than the compaction threshold so
+        // the cursor has run well ahead of the buffer's start.
+        let big = vec![7u8; super::DEFAULT_TX_CAPACITY];
+        io.write_all(&big).await.unwrap();
+        let published = super::TX_COMPACT_THRESHOLD / 2;
+        let mut sink = vec![0u8; published];
+        assert_eq!(handle.copy_tx_into(&mut sink), published);
+        assert!(sink.iter().all(|&b| b == 7));
+        handle.consume_tx(published);
+        assert_eq!(handle.tx_len(), super::DEFAULT_TX_CAPACITY - published);
+
+        // Room freed by publication is room a writer may use again.
+        io.write_all(&vec![9u8; published]).await.unwrap();
+        assert_eq!(handle.tx_len(), super::DEFAULT_TX_CAPACITY);
+
+        let drained = handle.take_tx(usize::MAX);
+        assert_eq!(drained.len(), super::DEFAULT_TX_CAPACITY);
+        assert_eq!(&drained[drained.len() - published..], &vec![9u8; published][..]);
+        assert_eq!(handle.tx_len(), 0);
     }
 
     #[tokio::test]

@@ -569,6 +569,10 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         outbound::Config {
             ingress_mode,
             emit_headers: !disable_headers,
+            #[cfg(feature = "doca")]
+            dmesh: None,
+            #[cfg(feature = "doca")]
+            dmesh_session: None,
             allow_discovery: AddrMatch::new(dst_profile_suffixes.clone(), dst_profile_networks),
             proxy: ProxyConfig {
                 server,

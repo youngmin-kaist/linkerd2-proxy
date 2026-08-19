@@ -55,18 +55,14 @@ fn main() {
         let dev_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_DEV_PCI_ADDR") {
             Ok(addr) => addr,
             Err(error) => {
-                eprintln!(
-                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}"
-                );
+                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}");
                 std::process::exit(EX_USAGE);
             }
         };
         let rep_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_REP_PCI_ADDR") {
             Ok(addr) => addr,
             Err(error) => {
-                eprintln!(
-                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}"
-                );
+                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}");
                 std::process::exit(EX_USAGE);
             }
         };

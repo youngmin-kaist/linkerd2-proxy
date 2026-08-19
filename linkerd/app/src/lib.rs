@@ -88,6 +88,10 @@ pub struct App {
     dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo>,
     #[cfg(feature = "doca")]
     dmesh_drain: drain::Watch,
+    #[cfg(feature = "doca")]
+    dmesh_backends: std::sync::Arc<dmesh_doca::Backends>,
+    #[cfg(feature = "doca")]
+    dmesh_metrics: std::sync::Arc<dmesh_doca::SessionMetrics>,
 }
 
 // === impl Config ===
@@ -95,6 +99,30 @@ pub struct App {
 impl Config {
     pub fn try_from_env() -> Result<Self, env::EnvError> {
         env::Env.try_config()
+    }
+
+    /// The DMesh adapter is outbound-only. Keep the local admin and ephemeral
+    /// inbound listeners on their configured default policy without asking the
+    /// Kubernetes policy controller about ports that do not belong to a Pod.
+    /// Per-session outbound policy discovery is built separately and remains
+    /// dynamic.
+    #[cfg(feature = "doca")]
+    pub fn disable_inbound_policy_discovery(&mut self) {
+        let inbound::policy::Config::Discover {
+            default,
+            cache_max_idle_age,
+            opaque_ports,
+            ..
+        } = self.inbound.policy.clone()
+        else {
+            return;
+        };
+        self.inbound.policy = inbound::policy::Config::Fixed {
+            default,
+            cache_max_idle_age,
+            ports: Default::default(),
+            opaque_ports,
+        };
     }
 
     /// Build an application.
@@ -229,6 +257,22 @@ impl Config {
             runtime.clone(),
             registry.sub_registry_with_prefix("inbound"),
         );
+        #[cfg(feature = "doca")]
+        let mut outbound = outbound;
+        // The DMesh backend registry and its session counters belong to this
+        // worker: the connector takes channels from the same registry the
+        // acceptor publishes into, and nothing is shared between workers.
+        #[cfg(feature = "doca")]
+        let dmesh_handles = {
+            let backends = std::sync::Arc::new(dmesh_doca::Backends::new());
+            let metrics =
+                dmesh_doca::SessionMetrics::register(registry.sub_registry_with_prefix("dmesh"));
+            outbound.dmesh = Some(dmesh_doca::Dmesh {
+                backends: backends.clone(),
+                metrics: metrics.clone(),
+            });
+            (backends, metrics)
+        };
         let outbound = Outbound::new(
             outbound,
             runtime,
@@ -273,16 +317,55 @@ impl Config {
             .bind(&outbound.config().proxy.server)
             .expect("Failed to bind outbound listener");
         let outbound_metrics = outbound.metrics();
-        // Second outbound instantiation over I = DmeshIo, fed by the DMA path.
-        // `mk` consumes `self`, so clone the (cloneable) Outbound and policies.
+        // Build one complete outbound stack per DMA frontend session. This
+        // makes every discovery, protocol, endpoint and reconnect cache local
+        // to that session, while the normal socket listener continues to use
+        // the stock address-keyed stack below.
         #[cfg(feature = "doca")]
-        let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = outbound
-            .clone()
-            .mk(
-                dst.profiles.clone(),
-                outbound_policies.clone(),
-                dst.resolve.clone(),
-            );
+        let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = {
+            let template = outbound.clone();
+            let profiles = dst.profiles.clone();
+            let default_workload = policies.workload.clone();
+            let policy_client = policies.client.clone();
+            let policy_backoff = policies.backoff;
+            let policy_limits = policies.limits;
+            let resolve = dst.resolve.clone();
+            let metrics = dmesh_handles.1.clone();
+            svc::ArcNewService::new(move |target: dmesh::DmeshTarget| {
+                let started = std::time::Instant::now();
+                let mut outbound = template.clone();
+                outbound.config_mut().dmesh_session = Some(target.param());
+                let configure = started.elapsed();
+
+                let started = std::time::Instant::now();
+                // A stock sidecar has one process-wide workload. This DPU
+                // proxy serves many Pods, so bind each session's policy watch
+                // to the workload granted with that Pod's registration. Empty
+                // workload values retain the configured default for legacy
+                // clients; production registration requires an explicit one.
+                let workload = if target.policy_workload().is_empty() {
+                    default_workload.clone()
+                } else {
+                    target.policy_workload().clone()
+                };
+                let session_policies = outbound.build_policies(
+                    workload,
+                    policy_client.clone(),
+                    policy_backoff,
+                    policy_limits,
+                    export_hostname_labels,
+                );
+                let stack = outbound.mk(profiles.clone(), session_policies, resolve.clone());
+                let layers = started.elapsed();
+
+                let started = std::time::Instant::now();
+                let service = svc::NewService::new_service(&stack, target);
+                metrics.observe_stack_build(configure, layers, started.elapsed());
+                service
+            })
+        };
+        #[cfg(feature = "doca")]
+        let (dmesh_backends, dmesh_metrics) = dmesh_handles;
         let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
 
         // Keep a drain subscriber for the dmesh acceptor (spawned post-build).
@@ -354,6 +437,10 @@ impl Config {
             dmesh_outbound,
             #[cfg(feature = "doca")]
             dmesh_drain,
+            #[cfg(feature = "doca")]
+            dmesh_backends,
+            #[cfg(feature = "doca")]
+            dmesh_metrics,
         })
     }
 
@@ -391,10 +478,24 @@ impl App {
     ) {
         let outbound = self.dmesh_outbound.clone();
         let shutdown = self.dmesh_drain.clone().signaled();
+        let backends = self.dmesh_backends.clone();
+        let metrics = self.dmesh_metrics.clone();
         tokio::spawn(
-            dmesh::serve(events, registrar, outbound, shutdown)
+            dmesh::serve(events, registrar, outbound, backends, metrics, shutdown)
                 .instrument(info_span!("dmesh").or_current()),
         );
+    }
+
+    /// The backend registry the DMesh connector takes channels from.
+    #[cfg(feature = "doca")]
+    pub fn dmesh_backends(&self) -> std::sync::Arc<dmesh_doca::Backends> {
+        self.dmesh_backends.clone()
+    }
+
+    /// Session counters shared by the adapter, the acceptor and the connector.
+    #[cfg(feature = "doca")]
+    pub fn dmesh_metrics(&self) -> std::sync::Arc<dmesh_doca::SessionMetrics> {
+        self.dmesh_metrics.clone()
     }
 
     pub fn inbound_addr(&self) -> Local<ServerAddr> {

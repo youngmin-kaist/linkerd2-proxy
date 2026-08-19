@@ -56,7 +56,9 @@ impl Pprof {
 
         Ok(http::Response::builder()
             .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .body(BoxBody::new(http_body_util::Full::new(bytes::Bytes::from(pb_gz))))
+            .body(BoxBody::new(http_body_util::Full::new(bytes::Bytes::from(
+                pb_gz,
+            ))))
             .expect("response must be valid"))
     }
 }

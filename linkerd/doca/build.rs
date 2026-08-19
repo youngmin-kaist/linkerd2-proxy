@@ -1,6 +1,12 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf};
 
 fn main() {
+    // External-datapath builds contain Rust components only.
+    if env::var_os("CARGO_FEATURE_OWN_DATAPATH").is_none() {
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+
     for file in [
         "src/shim.c",
         "../../../DPUMesh/buffer.c",
