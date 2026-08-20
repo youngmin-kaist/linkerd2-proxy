@@ -11,7 +11,9 @@ mod metrics;
 pub mod runtime;
 
 pub use api::{DmeshEvent, FlowId, Registrar, Registration, SessionToken, Slots, MAX_CONNS};
-pub use backend::{BackendKey, Backends, PublishError, TakeError};
+pub use backend::{
+    BackendKey, Backends, EndpointResolver, EndpointVerdict, PublishError, TakeError,
+};
 
 /// What one ARM worker's DMesh-specific outbound stack is wired to.
 ///

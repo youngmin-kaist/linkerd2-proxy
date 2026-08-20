@@ -13,6 +13,30 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// What an address the balancer selected resolves to.
+///
+/// DPUmesh chooses the backend Pod itself on the data path, so a selected
+/// endpoint is translated rather than dialled. Every outcome other than
+/// `Live` and `SessionOwn` declines the connection: a round robin or a TCP
+/// fallback would carry a protected stream somewhere its policy never named.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointVerdict {
+    /// The session's own service address; there is no endpoint to resolve.
+    SessionOwn,
+    /// A live registration serves it.
+    Live,
+    /// No live registration serves it.
+    Unresolved,
+    /// The generation places it on another node.
+    Remote,
+    /// The mapping predates the held generation.
+    Stale,
+}
+
+/// Resolves an address the balancer selected to a live destination.
+pub type EndpointResolver = Arc<dyn Fn(SocketAddr) -> EndpointVerdict + Send + Sync>;
 
 /// Identifies one session's backend channel.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -56,6 +80,13 @@ pub enum TakeError {
     /// The newest signed Service snapshot places the endpoint Linkerd selected
     /// in a different Service than the session's.
     TargetMismatch,
+    /// No live registration serves the selected endpoint.
+    EndpointUnresolved,
+    /// The generation places the selected endpoint on another node.
+    EndpointRemote,
+    /// The mapping from the selected endpoint to a Pod predates the held
+    /// generation.
+    EndpointStale,
 }
 
 impl fmt::Display for PublishError {
@@ -72,6 +103,9 @@ impl fmt::Display for TakeError {
             Self::NotPublished => write!(f, "no dmesh backend channel for this service"),
             Self::AlreadyTaken => write!(f, "the dmesh backend channel was already taken"),
             Self::TargetMismatch => write!(f, "the selected endpoint belongs to another dmesh Service"),
+            Self::EndpointUnresolved => write!(f, "no live registration serves the selected endpoint"),
+            Self::EndpointRemote => write!(f, "the selected endpoint is placed on another node"),
+            Self::EndpointStale => write!(f, "the selected endpoint's mapping predates the held generation"),
         }
     }
 }
@@ -86,7 +120,7 @@ struct Entry {
     io: Option<DmeshIo>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Registry {
     /// Preserves each service's publication order for diagnostics.
     by_service: HashMap<SocketAddr, Vec<SessionToken>>,
@@ -95,6 +129,23 @@ struct Registry {
     /// Which Service each address the newest signed generation names belongs
     /// to. Replaced wholesale, so an address a generation drops is unplaced.
     service_of_target: HashMap<SocketAddr, SocketAddr>,
+    /// Resolves a selected endpoint to a live destination. Absent until the
+    /// adapter installs one, in which case every placed address is taken as
+    /// this session's, which is the behaviour before endpoints were
+    /// authoritative.
+    #[allow(clippy::type_complexity)]
+    endpoints: Option<EndpointResolver>,
+}
+
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registry")
+            .field("by_service", &self.by_service)
+            .field("by_session", &self.by_session)
+            .field("service_of_target", &self.service_of_target)
+            .field("endpoints", &self.endpoints.is_some())
+            .finish()
+    }
 }
 
 /// Backend channels published by the sessions of one worker.
@@ -139,8 +190,13 @@ impl Backends {
     /// Linkerd discovery may replace the Service ClusterIP with a concrete
     /// endpoint, but it may not move a DMesh session to another Service. The
     /// newest signed generation decides: an address it places in another
-    /// Service is a mismatch, and an address it does not place is this
-    /// session's. The channel handed back is the session's own either way.
+    /// Service is a mismatch.
+    ///
+    /// Once endpoints are authoritative, an address the snapshot does not
+    /// place is no longer assumed to be this session's. The session's own
+    /// addresses resolve as such, and everything else must resolve to a live
+    /// destination — an endpoint that does not is declined by the reason it
+    /// failed for, never round-robined and never dialled over TCP.
     pub fn take_session(
         &self,
         session: SessionToken,
@@ -158,6 +214,14 @@ impl Backends {
         {
             return Err(TakeError::TargetMismatch);
         }
+        if let Some(resolve) = registry.endpoints.clone() {
+            match resolve(selected_target) {
+                EndpointVerdict::SessionOwn | EndpointVerdict::Live => {}
+                EndpointVerdict::Unresolved => return Err(TakeError::EndpointUnresolved),
+                EndpointVerdict::Remote => return Err(TakeError::EndpointRemote),
+                EndpointVerdict::Stale => return Err(TakeError::EndpointStale),
+            }
+        }
         let entry = registry
             .by_session
             .get_mut(&session)
@@ -170,6 +234,13 @@ impl Backends {
     /// session opened still governs that session's dial.
     pub fn place_targets(&self, placements: impl IntoIterator<Item = (SocketAddr, SocketAddr)>) {
         self.registry().service_of_target = placements.into_iter().collect();
+    }
+
+    /// Install the resolver that translates a selected endpoint to a live
+    /// destination. Applied to every subsequent take, including one for a
+    /// session that opened before it.
+    pub fn set_endpoint_resolver(&self, resolve: EndpointResolver) {
+        self.registry().endpoints = Some(resolve);
     }
 
     /// Evict exactly one session's entry, whether or not it was taken.

@@ -909,6 +909,10 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         gateway,
         inbound,
         shutdown_grace_period: shutdown_grace_period?.unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD),
+        // Set only where the process pins its own listeners to a default
+        // policy while the Pods it serves keep discovery.
+        #[cfg(feature = "doca")]
+        dmesh_inbound_policy: None,
     })
 }
 

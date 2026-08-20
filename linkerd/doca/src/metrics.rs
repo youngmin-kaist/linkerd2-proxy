@@ -14,17 +14,18 @@ use std::time::Duration;
 /// Why a control-plane admission decision was reached.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ControlEventLabels {
-    /// The decision surface: `grant`, `membership` or `revocation`.
+    /// The decision surface: `grant`, `membership`, `revocation` or `peer`.
     pub kind: String,
     /// A stable lowercase slug, `ok` for the accepting outcome.
     pub reason: String,
 }
 
-/// Registration, membership and revocation outcomes.
+/// Registration, membership, revocation and peer-channel outcomes.
 ///
-/// These are decided on the Comch control thread rather than on a worker, so
-/// the family is process-global and every worker's admin endpoint reports the
-/// same values.
+/// Registration decisions are taken on the Comch control thread and peer
+/// refusals on a data worker, so the family is process-global: it is written
+/// from several threads and every worker's admin endpoint reports the same
+/// values.
 pub fn control_events() -> &'static Family<ControlEventLabels, Counter> {
     static CONTROL_EVENTS: OnceLock<Family<ControlEventLabels, Counter>> = OnceLock::new();
     CONTROL_EVENTS.get_or_init(Family::default)

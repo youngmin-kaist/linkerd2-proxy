@@ -104,6 +104,15 @@ impl<S> Inbound<S> {
         &self.config
     }
 
+    /// Replace the policy configuration this instance builds stores from.
+    ///
+    /// One process may need two: a fixed default for its own ephemeral
+    /// listeners, which belong to no Pod, and a discovering one for the Pods
+    /// it is the inbound enforcement point for.
+    pub fn set_policy_config(&mut self, policy: policy::Config) {
+        self.config.policy = policy;
+    }
+
     pub fn identity(&self) -> &identity::creds::Receiver {
         &self.runtime.identity
     }

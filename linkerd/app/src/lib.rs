@@ -71,6 +71,11 @@ pub struct Config {
     /// If the proxy does not shut down gracefully within this timeout, it will
     /// terminate forcefully, closing any remaining connections.
     pub shutdown_grace_period: time::Duration,
+
+    /// The inbound policy configuration the per-destination-Pod stores are
+    /// built from, kept when the process-wide one is pinned to its default.
+    #[cfg(feature = "doca")]
+    pub dmesh_inbound_policy: Option<inbound::policy::Config>,
 }
 
 pub struct App {
@@ -92,7 +97,60 @@ pub struct App {
     dmesh_backends: std::sync::Arc<dmesh_doca::Backends>,
     #[cfg(feature = "doca")]
     dmesh_metrics: std::sync::Arc<dmesh_doca::SessionMetrics>,
+    /// Builds one inbound policy store per destination workload.
+    ///
+    /// A sidecar builds one store for the one workload it is the proxy for.
+    /// This proxy is the inbound enforcement point for every Pod its DPU
+    /// serves, so a store is bound per registered destination Pod and its
+    /// per-port watches are shared by every stream arriving at that Pod: the
+    /// cost scales with destination Pods and ports rather than with sessions.
+    #[cfg(feature = "doca")]
+    dmesh_inbound_policies: DmeshInboundPolicyBuilder,
 }
+
+/// A store of inbound policy watches, held per destination workload.
+#[cfg(feature = "doca")]
+pub type DmeshPolicyStore = std::sync::Arc<dyn inbound::policy::GetPolicy + Send + Sync + 'static>;
+
+/// Whether one destination Pod's inbound policy admits a connection.
+///
+/// Two inputs decide it and a Pod supplies neither. `client` is the source
+/// Pod's real cluster address, because the stock evaluation matches an
+/// authorization's `networks` first and an empty match denies — a synthetic
+/// address would make every realistic policy refuse every connection.
+/// `client_identity` is presented as a TLS *state* rather than as a string,
+/// because `Authentication::TlsAuthenticated` matches nothing else; `None` is
+/// an established connection carrying no client identity, which is what an
+/// unattested source is.
+#[cfg(feature = "doca")]
+pub fn dmesh_connection_verdict(
+    store: &DmeshPolicyStore,
+    destination: std::net::SocketAddr,
+    client: std::net::SocketAddr,
+    client_identity: Option<&str>,
+) -> bool {
+    use inbound::policy::GetPolicy;
+    use linkerd_app_core::{
+        identity, tls,
+        transport::{ClientAddr, OrigDstAddr, Remote},
+    };
+
+    let client_id = client_identity
+        .filter(|id| !id.is_empty())
+        .and_then(|id| id.parse::<identity::Id>().ok())
+        .map(tls::server::ClientId);
+    let tls = tls::ConditionalServerTls::Some(tls::ServerTls::Established {
+        client_id,
+        negotiated_protocol: None,
+    });
+    store
+        .get_policy(OrigDstAddr(destination))
+        .admits(Remote(ClientAddr(client)), &tls)
+}
+
+#[cfg(feature = "doca")]
+pub type DmeshInboundPolicyBuilder =
+    std::sync::Arc<dyn Fn(std::sync::Arc<str>) -> DmeshPolicyStore + Send + Sync + 'static>;
 
 // === impl Config ===
 
@@ -101,13 +159,18 @@ impl Config {
         env::Env.try_config()
     }
 
-    /// The DMesh adapter is outbound-only. Keep the local admin and ephemeral
-    /// inbound listeners on their configured default policy without asking the
-    /// Kubernetes policy controller about ports that do not belong to a Pod.
-    /// Per-session outbound policy discovery is built separately and remains
-    /// dynamic.
+    /// The proxy's own inbound and admin listeners are ephemeral and belong to
+    /// no Pod, so asking the Kubernetes policy controller about their ports
+    /// gets "unknown server" and nothing else. They keep their configured
+    /// default policy.
+    ///
+    /// This is not the inbound enforcement the DPU performs. That is per
+    /// destination Pod and fully dynamic: `dmesh_inbound_policy_config` keeps
+    /// the discovering configuration this rewrites away, and the per-workload
+    /// stores are built from it.
     #[cfg(feature = "doca")]
     pub fn disable_inbound_policy_discovery(&mut self) {
+        self.dmesh_inbound_policy = Some(self.inbound.policy.clone());
         let inbound::policy::Config::Discover {
             default,
             cache_max_idle_age,
@@ -152,6 +215,8 @@ impl Config {
         BAdmin: Bind<ServerConfig, BoundAddrs = Local<ServerAddr>> + Clone + 'static,
         BAdmin::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<AddrPair>,
     {
+        #[cfg(feature = "doca")]
+        let dmesh_inbound_policy = self.dmesh_inbound_policy.clone();
         let Config {
             admin,
             dns,
@@ -285,6 +350,30 @@ impl Config {
             policies.backoff,
             policies.limits,
         );
+
+        // The same construction, deferred and per workload: the DMesh adapter
+        // binds one store to each destination Pod it serves when that Pod
+        // registers, and drops it when the registration ends.
+        #[cfg(feature = "doca")]
+        let dmesh_inbound_policies: DmeshInboundPolicyBuilder = {
+            // The discovering configuration, even where the process-wide store
+            // was pinned to its default for the proxy's own ephemeral ports.
+            let mut inbound = inbound.clone();
+            if let Some(config) = dmesh_inbound_policy {
+                inbound.set_policy_config(config);
+            }
+            let client = policies.client.clone();
+            let backoff = policies.backoff;
+            let limits = policies.limits;
+            std::sync::Arc::new(move |workload: std::sync::Arc<str>| {
+                std::sync::Arc::new(inbound.build_policies(
+                    workload,
+                    client.clone(),
+                    backoff,
+                    limits,
+                )) as DmeshPolicyStore
+            })
+        };
 
         let outbound_policies = outbound.build_policies(
             policies.workload.clone(),
@@ -441,6 +530,8 @@ impl Config {
             dmesh_backends,
             #[cfg(feature = "doca")]
             dmesh_metrics,
+            #[cfg(feature = "doca")]
+            dmesh_inbound_policies,
         })
     }
 
@@ -496,6 +587,21 @@ impl App {
     #[cfg(feature = "doca")]
     pub fn dmesh_metrics(&self) -> std::sync::Arc<dmesh_doca::SessionMetrics> {
         self.dmesh_metrics.clone()
+    }
+
+    /// One inbound policy store for one destination workload. Its per-port
+    /// watches start on first use and end when the store is dropped, so the
+    /// adapter's cache lifetime is the watch lifetime.
+    #[cfg(feature = "doca")]
+    pub fn dmesh_inbound_policies(&self, workload: std::sync::Arc<str>) -> DmeshPolicyStore {
+        (self.dmesh_inbound_policies)(workload)
+    }
+
+    /// The builder itself, so a caller can keep binding stores after `spawn`
+    /// has consumed the app.
+    #[cfg(feature = "doca")]
+    pub fn dmesh_inbound_policy_builder(&self) -> DmeshInboundPolicyBuilder {
+        self.dmesh_inbound_policies.clone()
     }
 
     pub fn inbound_addr(&self) -> Local<ServerAddr> {
