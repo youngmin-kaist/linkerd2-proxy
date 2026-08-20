@@ -52,6 +52,42 @@ impl Peek for tokio::io::DuplexStream {
     }
 }
 
+// === DmeshSession ===
+
+/// Names the DPU DMA session a server-side connection belongs to.
+///
+/// Mirrors the datapath's session token: the worker that owns the session, the
+/// slot in its session table, and the generation guarding slot reuse.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DmeshSessionId {
+    pub worker: u16,
+    pub slot: u32,
+    pub generation: u32,
+}
+
+impl std::fmt::Display for DmeshSessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "w{}/s{}/g{}", self.worker, self.slot, self.generation)
+    }
+}
+
+/// An I/O type that may have arrived over a DPU DMA session.
+///
+/// Wrappers delegate to the underlying I/O so the session survives protocol
+/// detection and instrumentation; socket-based I/O has no session.
+pub trait DmeshSession {
+    fn dmesh_session(&self) -> Option<DmeshSessionId> {
+        None
+    }
+}
+
+impl DmeshSession for tokio::net::TcpStream {}
+
+#[cfg(feature = "tokio-test")]
+impl DmeshSession for tokio_test::io::Mock {}
+
+impl DmeshSession for tokio::io::DuplexStream {}
+
 // === PeerAddr ===
 
 pub trait PeerAddr {

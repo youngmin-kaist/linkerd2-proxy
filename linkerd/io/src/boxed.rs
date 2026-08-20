@@ -29,6 +29,10 @@ impl PeerAddr for BoxedIo {
     }
 }
 
+/// Boxing erases the session: a `BoxedIo` never reports one. The DMA path
+/// keeps its I/O concrete, so only socket-origin connections are ever boxed.
+impl crate::DmeshSession for BoxedIo {}
+
 impl AsyncRead for BoxedIo {
     fn poll_read(
         mut self: Pin<&mut Self>,

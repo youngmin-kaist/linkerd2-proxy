@@ -42,6 +42,26 @@ impl std::fmt::Display for SessionToken {
     }
 }
 
+impl From<SessionToken> for linkerd_io::DmeshSessionId {
+    fn from(token: SessionToken) -> Self {
+        Self {
+            worker: token.worker,
+            slot: token.slot,
+            generation: token.generation,
+        }
+    }
+}
+
+impl From<linkerd_io::DmeshSessionId> for SessionToken {
+    fn from(id: linkerd_io::DmeshSessionId) -> Self {
+        Self {
+            worker: id.worker,
+            slot: id.slot,
+            generation: id.generation,
+        }
+    }
+}
+
 /// Slot allocator handing out monotonically increasing generations.
 ///
 /// A slot returns to the free list on release and is handed out again with the

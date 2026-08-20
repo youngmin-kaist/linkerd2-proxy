@@ -42,7 +42,7 @@ impl<C> Outbound<C> {
         T: Clone + Debug + PartialEq + Eq + Hash + Send + Sync + 'static,
         T: svc::Param<watch::Receiver<Routes>>,
         // Server-side connection
-        I: io::AsyncRead + io::AsyncWrite + io::PeerAddr,
+        I: io::AsyncRead + io::AsyncWrite + io::PeerAddr + io::DmeshSession,
         I: Debug + Send + Sync + Unpin + 'static,
         // Endpoint discovery
         R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,

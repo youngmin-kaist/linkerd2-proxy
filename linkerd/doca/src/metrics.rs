@@ -63,8 +63,18 @@ pub struct SessionMetrics {
     pub backend_take_errors: Counter,
     /// Linkerd selected a target outside the authoritative Service snapshot.
     pub backend_target_mismatches: Counter,
+    /// The session a connection carried disagreed with the one its stack was
+    /// built for.
+    pub backend_session_mismatches: Counter,
+    /// Sessionless connects to a DMesh-provided address refused rather than
+    /// dialled over TCP.
+    pub backend_sessionless_refusals: Counter,
     /// Per-session outbound stacks built for DPUmesh frontend connections.
     pub session_stack_builds: Counter,
+    /// Frontend connections served by a reused per-workload outbound stack.
+    pub session_stack_cache_hits: Counter,
+    /// Frontend connections that had to build their workload's outbound stack.
+    pub session_stack_cache_misses: Counter,
     /// Time spent cloning/configuring the per-session outbound template.
     pub session_stack_configure_nanoseconds: Counter,
     /// Time spent constructing the per-session outbound layers.
@@ -140,9 +150,29 @@ impl SessionMetrics {
             metrics.backend_target_mismatches.clone(),
         );
         registry.register(
+            "backend_session_mismatches",
+            "Connections whose carried session disagreed with their stack's",
+            metrics.backend_session_mismatches.clone(),
+        );
+        registry.register(
+            "backend_sessionless_refusals",
+            "Sessionless connects to DMesh-provided addresses refused",
+            metrics.backend_sessionless_refusals.clone(),
+        );
+        registry.register(
             "session_stack_builds",
             "Per-session DPUmesh outbound stacks built",
             metrics.session_stack_builds.clone(),
+        );
+        registry.register(
+            "session_stack_cache_hits",
+            "Frontend connections served by a reused per-workload outbound stack",
+            metrics.session_stack_cache_hits.clone(),
+        );
+        registry.register(
+            "session_stack_cache_misses",
+            "Frontend connections that built their workload's outbound stack",
+            metrics.session_stack_cache_misses.clone(),
         );
         registry.register(
             "session_stack_configure_nanoseconds",
@@ -211,7 +241,9 @@ impl SessionMetrics {
     pub fn summary(&self) -> String {
         format!(
             "opened={} closed={} active={} pending={} orphaned={} aborted={} \
-             tasks={} cancelled={} take_errors={} target_mismatches={} stack_builds={} \
+             tasks={} cancelled={} take_errors={} target_mismatches={} \
+             session_mismatches={} sessionless_refusals={} stack_builds={} \
+             stack_hits={} stack_misses={} \
              stack_configure_ns={} stack_layers_ns={} stack_service_ns={} retired_slots={}",
             self.sessions_opened.get(),
             self.sessions_closed.get(),
@@ -223,7 +255,11 @@ impl SessionMetrics {
             self.tasks_cancelled.get(),
             self.backend_take_errors.get(),
             self.backend_target_mismatches.get(),
+            self.backend_session_mismatches.get(),
+            self.backend_sessionless_refusals.get(),
             self.session_stack_builds.get(),
+            self.session_stack_cache_hits.get(),
+            self.session_stack_cache_misses.get(),
             self.session_stack_configure_nanoseconds.get(),
             self.session_stack_layers_nanoseconds.get(),
             self.session_stack_service_nanoseconds.get(),

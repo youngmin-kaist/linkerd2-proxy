@@ -18,6 +18,7 @@ impl<C> Outbound<C> {
         // TCP endpoint target.
         T: svc::Param<Remote<ServerAddr>>,
         T: svc::Param<tls::ConditionalClientTls>,
+        T: svc::Param<session::SessionHandle>,
         T: svc::Param<Option<tagged_transport::PortOverride>>,
         T: svc::Param<Option<http::AuthorityOverride>>,
         T: svc::Param<Option<SessionProtocol>>,

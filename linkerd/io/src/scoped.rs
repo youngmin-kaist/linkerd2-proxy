@@ -77,6 +77,13 @@ impl<I: io::PeerAddr> io::PeerAddr for ScopedIo<I> {
     }
 }
 
+impl<I: io::DmeshSession> io::DmeshSession for ScopedIo<I> {
+    #[inline]
+    fn dmesh_session(&self) -> Option<io::DmeshSessionId> {
+        self.io.dmesh_session()
+    }
+}
+
 impl<I: io::AsyncRead> io::AsyncRead for ScopedIo<I> {
     #[inline]
     fn poll_read(

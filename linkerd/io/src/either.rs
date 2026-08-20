@@ -33,6 +33,16 @@ impl<L: io::PeerAddr, R: io::PeerAddr> io::PeerAddr for EitherIo<L, R> {
     }
 }
 
+impl<L: io::DmeshSession, R: io::DmeshSession> io::DmeshSession for EitherIo<L, R> {
+    #[inline]
+    fn dmesh_session(&self) -> Option<io::DmeshSessionId> {
+        match self {
+            Self::Left(l) => l.dmesh_session(),
+            Self::Right(r) => r.dmesh_session(),
+        }
+    }
+}
+
 impl<L: io::AsyncRead, R: io::AsyncRead> io::AsyncRead for EitherIo<L, R> {
     #[inline]
     fn poll_read(

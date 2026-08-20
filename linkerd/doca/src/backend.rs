@@ -102,10 +102,17 @@ impl fmt::Display for TakeError {
         match self {
             Self::NotPublished => write!(f, "no dmesh backend channel for this service"),
             Self::AlreadyTaken => write!(f, "the dmesh backend channel was already taken"),
-            Self::TargetMismatch => write!(f, "the selected endpoint belongs to another dmesh Service"),
-            Self::EndpointUnresolved => write!(f, "no live registration serves the selected endpoint"),
+            Self::TargetMismatch => {
+                write!(f, "the selected endpoint belongs to another dmesh Service")
+            }
+            Self::EndpointUnresolved => {
+                write!(f, "no live registration serves the selected endpoint")
+            }
             Self::EndpointRemote => write!(f, "the selected endpoint is placed on another node"),
-            Self::EndpointStale => write!(f, "the selected endpoint's mapping predates the held generation"),
+            Self::EndpointStale => write!(
+                f,
+                "the selected endpoint's mapping predates the held generation"
+            ),
         }
     }
 }
@@ -274,6 +281,14 @@ impl Backends {
         self.registry().by_service.contains_key(service)
     }
 
+    /// True when DPUmesh provides the address: it names a published Service or
+    /// an endpoint the newest signed generation places. A sessionless dial to
+    /// such an address must be refused rather than fall through to TCP.
+    pub fn manages(&self, addr: &SocketAddr) -> bool {
+        let registry = self.registry();
+        registry.by_service.contains_key(addr) || registry.service_of_target.contains_key(addr)
+    }
+
     /// Sessions currently providing a service, in publication order.
     pub fn sessions_for(&self, service: &SocketAddr) -> Vec<SessionToken> {
         self.registry()
@@ -303,7 +318,7 @@ mod tests {
     }
 
     fn io(peer: SocketAddr) -> DmeshIo {
-        dmesh_io_pair(peer).0
+        dmesh_io_pair(peer, None).0
     }
 
     #[test]

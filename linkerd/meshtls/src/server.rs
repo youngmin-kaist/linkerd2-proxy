@@ -195,3 +195,10 @@ impl<I: io::PeerAddr> io::PeerAddr for ServerIo<I> {
         self.0.get_ref().0.peer_addr()
     }
 }
+
+impl<I: io::DmeshSession> io::DmeshSession for ServerIo<I> {
+    #[inline]
+    fn dmesh_session(&self) -> Option<io::DmeshSessionId> {
+        self.0.get_ref().0.dmesh_session()
+    }
+}

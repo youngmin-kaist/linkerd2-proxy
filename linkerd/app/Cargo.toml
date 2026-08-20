@@ -20,6 +20,7 @@ pprof = ["linkerd-app-admin/pprof"]
 [dependencies]
 dmesh-doca = { path = "../doca", optional = true }
 futures = { version = "0.3", default-features = false }
+parking_lot = "0.12"
 hyper-util = { workspace = true }
 linkerd-app-admin = { path = "./admin" }
 linkerd-app-core = { path = "./core" }

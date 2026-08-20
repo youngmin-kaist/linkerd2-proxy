@@ -79,7 +79,7 @@ impl Outbound<()> {
         T: svc::Param<OrigDstAddr>,
         T: Clone + Send + Sync + 'static,
         // Server-side socket.
-        I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr,
+        I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr + io::DmeshSession,
         I: Debug + Unpin + Send + Sync + 'static,
         // Endpoint resolver.
         R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,

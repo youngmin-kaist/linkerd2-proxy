@@ -203,11 +203,13 @@ impl Config {
     ) -> Result<App, Error>
     where
         BIn: Bind<ServerConfig, BoundAddrs = Local<ServerAddr>> + 'static,
+        BIn::Io: linkerd_app_core::io::DmeshSession,
         BIn::Addrs: Param<Remote<ClientAddr>>
             + Param<Local<ServerAddr>>
             + Param<OrigDstAddr>
             + Param<AddrPair>,
         BOut: Bind<ServerConfig, BoundAddrs = DualLocal<ServerAddr>> + 'static,
+        BOut::Io: linkerd_app_core::io::DmeshSession,
         BOut::Addrs: Param<Remote<ClientAddr>>
             + Param<Local<ServerAddr>>
             + Param<OrigDstAddr>
@@ -406,10 +408,14 @@ impl Config {
             .bind(&outbound.config().proxy.server)
             .expect("Failed to bind outbound listener");
         let outbound_metrics = outbound.metrics();
-        // Build one complete outbound stack per DMA frontend session. This
-        // makes every discovery, protocol, endpoint and reconnect cache local
-        // to that session, while the normal socket listener continues to use
-        // the stock address-keyed stack below.
+        // Build the outbound stacks serving DMA frontend connections. With
+        // shared stacks enabled, one stack is built per source workload and
+        // reused by every session of that workload: connections resolve their
+        // backend channels through the session each one carries, and the
+        // policy watch is workload-scoped either way. Otherwise one complete
+        // stack is built per session, keeping every discovery, protocol,
+        // endpoint and reconnect cache session-local. The normal socket
+        // listener continues to use the stock address-keyed stack below.
         #[cfg(feature = "doca")]
         let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = {
             let template = outbound.clone();
@@ -420,13 +426,17 @@ impl Config {
             let policy_limits = policies.limits;
             let resolve = dst.resolve.clone();
             let metrics = dmesh_handles.1.clone();
+            let shared = outbound.config().dmesh_shared_stacks;
+            // Keyed by workload, which the per-node registration cap bounds;
+            // the guard is a backstop against unbounded workload churn.
+            let cache: parking_lot::Mutex<
+                std::collections::HashMap<
+                    std::sync::Arc<str>,
+                    svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo>,
+                >,
+            > = Default::default();
+            const CACHE_CAP: usize = 64;
             svc::ArcNewService::new(move |target: dmesh::DmeshTarget| {
-                let started = std::time::Instant::now();
-                let mut outbound = template.clone();
-                outbound.config_mut().dmesh_session = Some(target.param());
-                let configure = started.elapsed();
-
-                let started = std::time::Instant::now();
                 // A stock sidecar has one process-wide workload. This DPU
                 // proxy serves many Pods, so bind each session's policy watch
                 // to the workload granted with that Pod's registration. Empty
@@ -437,8 +447,27 @@ impl Config {
                 } else {
                     target.policy_workload().clone()
                 };
+
+                if shared {
+                    if let Some(stack) = cache.lock().get(&workload) {
+                        metrics.session_stack_cache_hits.inc();
+                        return svc::NewService::new_service(stack, target);
+                    }
+                }
+
+                let started = std::time::Instant::now();
+                let mut outbound = template.clone();
+                // A shared stack serves many sessions, so no session is baked
+                // in; each connection carries its own. A per-session stack
+                // bakes its session as a fallback and consistency check.
+                outbound.config_mut().dmesh_session =
+                    if shared { None } else { Some(target.param()) };
+                outbound.config_mut().dmesh_origin = true;
+                let configure = started.elapsed();
+
+                let started = std::time::Instant::now();
                 let session_policies = outbound.build_policies(
-                    workload,
+                    workload.clone(),
                     policy_client.clone(),
                     policy_backoff,
                     policy_limits,
@@ -450,6 +479,18 @@ impl Config {
                 let started = std::time::Instant::now();
                 let service = svc::NewService::new_service(&stack, target);
                 metrics.observe_stack_build(configure, layers, started.elapsed());
+                if shared {
+                    metrics.session_stack_cache_misses.inc();
+                    let mut cache = cache.lock();
+                    if cache.len() >= CACHE_CAP {
+                        tracing::warn!(
+                            workloads = cache.len(),
+                            "Dropping the shared dmesh stack cache; workload churn exceeded its cap"
+                        );
+                        cache.clear();
+                    }
+                    cache.insert(workload, stack);
+                }
                 service
             })
         };

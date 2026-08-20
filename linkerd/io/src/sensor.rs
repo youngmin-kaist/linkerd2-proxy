@@ -83,6 +83,12 @@ impl<T: PeerAddr, S> PeerAddr for SensorIo<T, S> {
     }
 }
 
+impl<T: crate::DmeshSession, S> crate::DmeshSession for SensorIo<T, S> {
+    fn dmesh_session(&self) -> Option<crate::DmeshSessionId> {
+        self.io.dmesh_session()
+    }
+}
+
 #[async_trait::async_trait]
 impl<I: Peek + Send + Sync, S: Sensor + Sync> Peek for SensorIo<I, S> {
     async fn peek(&self, buf: &mut [u8]) -> Result<usize> {

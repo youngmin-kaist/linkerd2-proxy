@@ -50,6 +50,13 @@ impl<I: io::PeerAddr> io::PeerAddr for PrefixedIo<I> {
     }
 }
 
+impl<I: io::DmeshSession> io::DmeshSession for PrefixedIo<I> {
+    #[inline]
+    fn dmesh_session(&self) -> Option<io::DmeshSessionId> {
+        self.io.dmesh_session()
+    }
+}
+
 impl<I: io::AsyncRead> io::AsyncRead for PrefixedIo<I> {
     fn poll_read(
         self: Pin<&mut Self>,

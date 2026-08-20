@@ -2,6 +2,7 @@ use super::Logical;
 use crate::{
     metrics::BalancerMetricsParams,
     stack_labels,
+    tcp::session,
     zone::{tcp_zone_labels, TcpZoneLabels},
     BackendRef, Outbound, ParentRef,
 };
@@ -143,12 +144,12 @@ impl<C> Outbound<C> {
         T: svc::Param<BackendRef>,
         T: svc::Param<ParentRef>,
         // Server-side socket.
-        I: io::AsyncRead + io::AsyncWrite + Debug + Send + Unpin + 'static,
+        I: io::AsyncRead + io::AsyncWrite + io::DmeshSession + Debug + Send + Unpin + 'static,
         // Endpoint resolution.
         R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,
         R::Resolution: Unpin,
         // Endpoint connector.
-        C: svc::MakeConnection<Endpoint<T>> + Clone + Send + 'static,
+        C: svc::MakeConnection<session::SessionEndpoint<Endpoint<T>>> + Clone + Send + 'static,
         C::Connection: Send + Unpin,
         C::Metadata: Send + Unpin,
         C::Future: Send,
@@ -163,7 +164,7 @@ impl<C> Outbound<C> {
 
             let connect = inner
                 .push(svc::stack::WithoutConnectionMetadata::layer())
-                .push_new_thunk();
+                .push(session::NewThunkSession::layer());
 
             let forward = connect
                 .clone()
@@ -243,7 +244,7 @@ impl<C> Outbound<C> {
                     },
                     svc::stack(fail).check_new_clone().into_inner(),
                 )
-                .push_on_service(tcp::Forward::layer())
+                .push_on_service(tcp::ForwardSession::layer())
                 .push_on_service(drain::Retain::layer(rt.drain.clone()))
                 .push(svc::ArcNewService::layer())
         })

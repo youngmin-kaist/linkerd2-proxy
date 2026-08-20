@@ -1,4 +1,7 @@
-use crate::{tcp::Connect, ConnectMeta};
+use crate::{
+    tcp::{session::SessionHandle, Connect},
+    ConnectMeta,
+};
 use futures::prelude::*;
 use linkerd_app_core::{
     dns,
@@ -46,6 +49,7 @@ impl<T, S> svc::Service<T> for TaggedTransport<S>
 where
     T: svc::Param<tls::ConditionalClientTls>
         + svc::Param<Remote<ServerAddr>>
+        + svc::Param<SessionHandle>
         + svc::Param<Option<PortOverride>>
         + svc::Param<Option<http::AuthorityOverride>>
         + svc::Param<Option<SessionProtocol>>,
@@ -64,10 +68,11 @@ where
     }
 
     fn call(&mut self, ep: T) -> Self::Future {
+        let session: SessionHandle = ep.param();
         let tls: tls::ConditionalClientTls = ep.param();
         if let tls::ConditionalClientTls::None(reason) = tls {
             trace!(%reason, "Not attempting opaque transport");
-            let target = Connect::new(ep.param(), tls);
+            let target = Connect::new(ep.param(), tls).with_session(session);
             return Box::pin(self.inner.connect(target).err_into::<Error>());
         }
 
@@ -106,10 +111,10 @@ where
 
         let protocol: Option<SessionProtocol> = ep.param();
 
-        let connect = self.inner.connect(Connect::new(
-            Remote(ServerAddr((addr.ip(), connect_port).into())),
-            tls,
-        ));
+        let connect = self.inner.connect(
+            Connect::new(Remote(ServerAddr((addr.ip(), connect_port).into())), tls)
+                .with_session(session),
+        );
         Box::pin(async move {
             let (mut io, meta) = connect.await.map_err(Into::into)?;
 
@@ -192,6 +197,12 @@ mod test {
     impl svc::Param<Option<SessionProtocol>> for Endpoint {
         fn param(&self) -> Option<SessionProtocol> {
             self.proto.clone()
+        }
+    }
+
+    impl svc::Param<SessionHandle> for Endpoint {
+        fn param(&self) -> SessionHandle {
+            SessionHandle(None)
         }
     }
 

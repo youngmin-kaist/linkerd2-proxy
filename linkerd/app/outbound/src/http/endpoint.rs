@@ -204,6 +204,16 @@ impl<T: svc::Param<Remote<ServerAddr>>> svc::Param<Remote<ServerAddr>> for Conne
     }
 }
 
+/// HTTP client connections are pooled per endpoint and may carry requests from
+/// any session, so they never dial on behalf of one; a single-session stack
+/// reaches its channel through the session baked into its connector.
+impl<T> svc::Param<crate::tcp::session::SessionHandle> for Connect<T> {
+    #[inline]
+    fn param(&self) -> crate::tcp::session::SessionHandle {
+        crate::tcp::session::SessionHandle(None)
+    }
+}
+
 impl<T: svc::Param<tls::ConditionalClientTls>> svc::Param<tls::ConditionalClientTls>
     for Connect<T>
 {

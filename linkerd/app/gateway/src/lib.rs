@@ -63,7 +63,7 @@ impl Gateway {
         T: svc::Param<Option<SessionProtocol>>,
         T: Clone + Send + Sync + Unpin + 'static,
         // Server-side socket
-        I: io::AsyncRead + io::AsyncWrite + io::PeerAddr,
+        I: io::AsyncRead + io::AsyncWrite + io::PeerAddr + io::DmeshSession,
         I: Debug + Send + Sync + Unpin + 'static,
         // Endpoint resolution.
         R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,

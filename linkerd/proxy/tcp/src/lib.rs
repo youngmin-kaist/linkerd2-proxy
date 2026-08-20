@@ -4,4 +4,7 @@
 pub mod balance;
 pub mod forward;
 
-pub use self::{balance::NewBalance, forward::Forward};
+pub use self::{
+    balance::NewBalance,
+    forward::{Forward, ForwardSession},
+};

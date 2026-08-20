@@ -40,14 +40,18 @@ async fn forward() {
     // Build the TCP logical stack with a mocked connector.
     let (rt, _shutdown) = runtime();
     let stack = Outbound::new(default_config(), rt, &mut Default::default())
-        .with_stack(svc::mk(move |ep: concrete::Endpoint<Concrete<Target>>| {
-            let Remote(ServerAddr(ea)) = svc::Param::param(&ep);
-            assert_eq!(ea, ep_addr);
-            let mut io = support::io();
-            io.write(b"hola").read(b"mundo");
-            let local = Local(ClientAddr(([0, 0, 0, 0], 4444).into()));
-            future::ok::<_, support::io::Error>((io.build(), local))
-        }))
+        .with_stack(svc::mk(
+            move |ep: crate::tcp::session::SessionEndpoint<
+                concrete::Endpoint<Concrete<Target>>,
+            >| {
+                let Remote(ServerAddr(ea)) = svc::Param::param(&ep);
+                assert_eq!(ea, ep_addr);
+                let mut io = support::io();
+                io.write(b"hola").read(b"mundo");
+                let local = Local(ClientAddr(([0, 0, 0, 0], 4444).into()));
+                future::ok::<_, support::io::Error>((io.build(), local))
+            },
+        ))
         .push_opaq_concrete(resolve)
         .push_opaq_logical()
         .into_inner();
@@ -94,7 +98,9 @@ async fn balances() {
     let (rt, _shutdown) = runtime();
     let svc = Outbound::new(default_config(), rt, &mut Default::default())
         .with_stack(svc::mk(
-            move |ep: concrete::Endpoint<Concrete<Target>>| match svc::Param::param(&ep) {
+            move |ep: crate::tcp::session::SessionEndpoint<
+                concrete::Endpoint<Concrete<Target>>,
+            >| match svc::Param::param(&ep) {
                 Remote(ServerAddr(addr)) if addr == ep0_addr => {
                     tracing::debug!(%addr, "writing ep0");
                     let mut io = support::io();

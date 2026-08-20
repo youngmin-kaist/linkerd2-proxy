@@ -216,7 +216,7 @@ pub async fn serve<N>(
         match ev {
             DmeshEvent::ConnReady(token, flow) => {
                 let peer = SocketAddr::V4(flow.src);
-                let (io, handle) = dmesh_io_pair(peer);
+                let (io, handle) = dmesh_io_pair(peer, Some(token));
                 // Register the IO handle so the driver pumps recv segments into
                 // it and picks up the stack's writes.
                 if registrar.send(Registration { token, handle }).is_err() {

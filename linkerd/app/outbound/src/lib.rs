@@ -92,12 +92,24 @@ pub struct Config {
 
     /// Binds a DMesh-only outbound stack to exactly one frontend session.
     ///
-    /// The normal socket listener leaves this unset. The DMA acceptor builds a
-    /// fresh outbound stack for each session and sets it before the stack is
-    /// constructed, so every transport/reconnect cache in that stack is
-    /// session-local without changing stock TCP cache keys.
+    /// The normal socket listener leaves this unset. A stack built for a
+    /// single session sets it as a fallback and consistency check for the
+    /// session each connection carries; a stack shared by a workload's
+    /// sessions leaves it unset and relies on the carried session alone.
     #[cfg(feature = "doca")]
     pub dmesh_session: Option<dmesh_doca::SessionToken>,
+
+    /// True on stacks built for DMA frontend connections; makes a sessionless
+    /// dial to a DMesh-provided address fail instead of falling back to TCP.
+    #[cfg(feature = "doca")]
+    pub dmesh_origin: bool,
+
+    /// Share one DMesh outbound stack among all of a workload's sessions
+    /// instead of building one per session. Connections resolve their backend
+    /// channels through the session they carry, so nothing in the shared
+    /// stack depends on which session is dialing.
+    #[cfg(feature = "doca")]
+    pub dmesh_shared_stacks: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -257,7 +269,7 @@ impl Outbound<()> {
         T: svc::Param<OrigDstAddr>,
         T: Clone + Send + Sync + 'static,
         // Server-side socket.
-        I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr,
+        I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr + io::DmeshSession,
         I: Debug + Unpin + Send + Sync + 'static,
         // Endpoint resolution.
         R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,

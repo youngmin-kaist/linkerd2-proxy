@@ -8,6 +8,7 @@ use linkerd_app_core::{
 
 mod connect;
 mod endpoint;
+pub mod session;
 pub mod tagged_transport;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

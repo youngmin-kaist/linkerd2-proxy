@@ -22,9 +22,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use linkerd_io::{Peek, PeerAddr};
+use linkerd_io::{DmeshSession, DmeshSessionId, Peek, PeerAddr};
 use parking_lot::{Mutex, MutexGuard};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::api::SessionToken;
 
 /// Default cap on buffered-but-unsent bytes before writers see backpressure.
 const DEFAULT_TX_CAPACITY: usize = 256 * 1024;
@@ -124,6 +126,10 @@ impl Inner {
 pub struct DmeshIo {
     inner: Arc<Mutex<Inner>>,
     peer: SocketAddr,
+    /// The DMA session this endpoint belongs to, carried so the outbound
+    /// connector can resolve the session's backend channel from the
+    /// connection itself rather than from stack configuration.
+    session: Option<SessionToken>,
 }
 
 /// Driver-facing endpoint bridging the DMA staging buffer to the stack.
@@ -149,8 +155,9 @@ unsafe impl Send for DmeshIoHandle {}
 unsafe impl Sync for DmeshIoHandle {}
 
 /// Create a connected pair. The driver keeps the handle, the stack gets the IO.
-/// `peer` is the flow's source address, reported via `PeerAddr`.
-pub fn dmesh_io_pair(peer: SocketAddr) -> (DmeshIo, DmeshIoHandle) {
+/// `peer` is the flow's source address, reported via `PeerAddr`; `session`
+/// names the DMA session the flow belongs to, reported via `DmeshSession`.
+pub fn dmesh_io_pair(peer: SocketAddr, session: Option<SessionToken>) -> (DmeshIo, DmeshIoHandle) {
     let inner = Arc::new(Mutex::new(Inner {
         tx_capacity: DEFAULT_TX_CAPACITY,
         ..Inner::default()
@@ -159,6 +166,7 @@ pub fn dmesh_io_pair(peer: SocketAddr) -> (DmeshIo, DmeshIoHandle) {
         DmeshIo {
             inner: inner.clone(),
             peer,
+            session,
         },
         DmeshIoHandle { inner },
     )
@@ -261,6 +269,12 @@ impl Peek for DmeshIo {
     /// back to `read_buf` + `PrefixedIo` replay (see linkerd-tls / http-detect).
     async fn peek(&self, _buf: &mut [u8]) -> io::Result<usize> {
         Ok(0)
+    }
+}
+
+impl DmeshSession for DmeshIo {
+    fn dmesh_session(&self) -> Option<DmeshSessionId> {
+        self.session.map(Into::into)
     }
 }
 
@@ -433,7 +447,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn pair() -> (DmeshIo, DmeshIoHandle) {
-        dmesh_io_pair("127.0.0.1:40000".parse().unwrap())
+        dmesh_io_pair("127.0.0.1:40000".parse().unwrap(), None)
     }
 
     #[tokio::test]
@@ -564,7 +578,10 @@ mod tests {
 
         let drained = handle.take_tx(usize::MAX);
         assert_eq!(drained.len(), super::DEFAULT_TX_CAPACITY);
-        assert_eq!(&drained[drained.len() - published..], &vec![9u8; published][..]);
+        assert_eq!(
+            &drained[drained.len() - published..],
+            &vec![9u8; published][..]
+        );
         assert_eq!(handle.tx_len(), 0);
     }
 
