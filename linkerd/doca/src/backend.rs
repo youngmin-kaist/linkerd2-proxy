@@ -8,7 +8,7 @@
 //! The registry is owned, not global: each ARM worker builds one and hands it
 //! to its adapter and its connector, so no lock is shared between workers.
 
-use crate::{api::SessionToken, DmeshIo};
+use crate::{api::SessionToken, BackendRoute, DmeshIo};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt;
@@ -21,16 +21,16 @@ use std::sync::Arc;
 /// endpoint is translated rather than dialled. Every outcome other than
 /// `Live` and `SessionOwn` declines the connection: a round robin or a TCP
 /// fallback would carry a protected stream somewhere its policy never named.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EndpointVerdict {
     /// The session's own service address; there is no endpoint to resolve.
     SessionOwn,
     /// A live registration serves it.
-    Live,
+    Live(i32),
     /// No live registration serves it.
     Unresolved,
     /// The generation places it on another node.
-    Remote,
+    Remote(String),
     /// The mapping predates the held generation.
     Stale,
 }
@@ -82,8 +82,6 @@ pub enum TakeError {
     TargetMismatch,
     /// No live registration serves the selected endpoint.
     EndpointUnresolved,
-    /// The generation places the selected endpoint on another node.
-    EndpointRemote,
     /// The mapping from the selected endpoint to a Pod predates the held
     /// generation.
     EndpointStale,
@@ -108,7 +106,6 @@ impl fmt::Display for TakeError {
             Self::EndpointUnresolved => {
                 write!(f, "no live registration serves the selected endpoint")
             }
-            Self::EndpointRemote => write!(f, "the selected endpoint is placed on another node"),
             Self::EndpointStale => write!(
                 f,
                 "the selected endpoint's mapping predates the held generation"
@@ -221,19 +218,24 @@ impl Backends {
         {
             return Err(TakeError::TargetMismatch);
         }
-        if let Some(resolve) = registry.endpoints.clone() {
+        let route = if let Some(resolve) = registry.endpoints.clone() {
             match resolve(selected_target) {
-                EndpointVerdict::SessionOwn | EndpointVerdict::Live => {}
+                EndpointVerdict::SessionOwn => BackendRoute::Any,
+                EndpointVerdict::Live(pod) => BackendRoute::Local(pod),
                 EndpointVerdict::Unresolved => return Err(TakeError::EndpointUnresolved),
-                EndpointVerdict::Remote => return Err(TakeError::EndpointRemote),
+                EndpointVerdict::Remote(uid) => BackendRoute::Remote(uid),
                 EndpointVerdict::Stale => return Err(TakeError::EndpointStale),
             }
-        }
+        } else {
+            BackendRoute::Any
+        };
         let entry = registry
             .by_session
             .get_mut(&session)
             .expect("the session entry was just read");
-        entry.io.take().ok_or(TakeError::AlreadyTaken)
+        let io = entry.io.take().ok_or(TakeError::AlreadyTaken)?;
+        io.set_backend_route(route);
+        Ok(io)
     }
 
     /// Install the newest signed view of which Service each address belongs to.

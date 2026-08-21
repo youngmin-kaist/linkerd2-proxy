@@ -110,10 +110,6 @@ pub const ENV_SHUTDOWN_ENDPOINT_ENABLED: &str = "LINKERD2_PROXY_SHUTDOWN_ENDPOIN
 
 const ENV_INGRESS_MODE: &str = "LINKERD2_PROXY_INGRESS_MODE";
 
-/// Share one DMesh outbound stack among all of a workload's sessions.
-#[cfg(feature = "doca")]
-const ENV_DMESH_SHARED_STACKS: &str = "LINKERD2_PROXY_DMESH_SHARED_STACKS";
-
 const ENV_INBOUND_HTTP_QUEUE_CAPACITY: &str = "LINKERD2_PROXY_INBOUND_HTTP_QUEUE_CAPACITY";
 const ENV_INBOUND_HTTP_FAILFAST_TIMEOUT: &str = "LINKERD2_PROXY_INBOUND_HTTP_FAILFAST_TIMEOUT";
 
@@ -579,9 +575,6 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             dmesh_session: None,
             #[cfg(feature = "doca")]
             dmesh_origin: false,
-            #[cfg(feature = "doca")]
-            dmesh_shared_stacks: parse(strings, ENV_DMESH_SHARED_STACKS, parse_bool)?
-                .unwrap_or(false),
             allow_discovery: AddrMatch::new(dst_profile_suffixes.clone(), dst_profile_networks),
             proxy: ProxyConfig {
                 server,

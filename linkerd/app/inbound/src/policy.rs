@@ -172,11 +172,7 @@ impl AllowPolicy {
     /// and `connection_verdict` is the evaluation it must use — the same one
     /// the stack applies, against the same watched policy, so the two cannot
     /// disagree.
-    pub fn admits(
-        &self,
-        client: Remote<ClientAddr>,
-        tls: &tls::ConditionalServerTls,
-    ) -> bool {
+    pub fn admits(&self, client: Remote<ClientAddr>, tls: &tls::ConditionalServerTls) -> bool {
         connection_verdict(&self.server.borrow(), client, tls)
     }
 
@@ -318,7 +314,9 @@ mod tests {
     use std::sync::Arc;
 
     fn meta() -> Arc<Meta> {
-        Arc::new(Meta::Default { name: "test".into() })
+        Arc::new(Meta::Default {
+            name: "test".into(),
+        })
     }
 
     fn admits_everyone() -> Authorization {

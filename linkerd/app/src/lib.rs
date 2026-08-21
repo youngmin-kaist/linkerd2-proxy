@@ -17,13 +17,15 @@ pub mod trace_collector;
 pub use self::metrics::Metrics;
 use futures::{future, Future, FutureExt};
 use linkerd_app_admin as admin;
+#[cfg(feature = "doca")]
+use linkerd_app_core::svc;
 use linkerd_app_core::{
     config::ServerConfig,
     control::{ControlAddr, Metrics as ControlMetrics},
     dns, drain,
     metrics::{legacy::FmtMetrics, prom},
     serve,
-    svc::{self, Param},
+    svc::Param,
     tls_info,
     transport::{addrs::*, listen::Bind},
     Error, ProxyRuntime,
@@ -408,14 +410,11 @@ impl Config {
             .bind(&outbound.config().proxy.server)
             .expect("Failed to bind outbound listener");
         let outbound_metrics = outbound.metrics();
-        // Build the outbound stacks serving DMA frontend connections. With
-        // shared stacks enabled, one stack is built per source workload and
-        // reused by every session of that workload: connections resolve their
-        // backend channels through the session each one carries, and the
-        // policy watch is workload-scoped either way. Otherwise one complete
-        // stack is built per session, keeping every discovery, protocol,
-        // endpoint and reconnect cache session-local. The normal socket
-        // listener continues to use the stock address-keyed stack below.
+        // Build the outbound stacks serving DMA frontend connections. Opaque
+        // byte streams share one stack per source workload because their
+        // session remains attached to the I/O through the connector. HTTP
+        // sessions get a session-local stack so physical H1/H2 transports and
+        // reconnect caches cannot cross SessionToken boundaries.
         #[cfg(feature = "doca")]
         let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = {
             let template = outbound.clone();
@@ -426,7 +425,6 @@ impl Config {
             let policy_limits = policies.limits;
             let resolve = dst.resolve.clone();
             let metrics = dmesh_handles.1.clone();
-            let shared = outbound.config().dmesh_shared_stacks;
             // Keyed by workload, which the per-node registration cap bounds;
             // the guard is a backstop against unbounded workload churn.
             let cache: parking_lot::Mutex<
@@ -448,7 +446,13 @@ impl Config {
                     target.policy_workload().clone()
                 };
 
-                if shared {
+                /* Opaque forwarding carries SessionToken on the source I/O all
+                 * the way to the connector, so its policy/discovery stack may
+                 * be shared. HTTP parsing turns the byte stream into requests;
+                 * keep that stack session-local so its H1/H2 pools and reconnect
+                 * caches can only consume this session's backend channel. */
+                let share_this_session = !target.protocol_aware();
+                if share_this_session {
                     if let Some(stack) = cache.lock().get(&workload) {
                         metrics.session_stack_cache_hits.inc();
                         return svc::NewService::new_service(stack, target);
@@ -460,8 +464,11 @@ impl Config {
                 // A shared stack serves many sessions, so no session is baked
                 // in; each connection carries its own. A per-session stack
                 // bakes its session as a fallback and consistency check.
-                outbound.config_mut().dmesh_session =
-                    if shared { None } else { Some(target.param()) };
+                outbound.config_mut().dmesh_session = if share_this_session {
+                    None
+                } else {
+                    Some(target.param())
+                };
                 outbound.config_mut().dmesh_origin = true;
                 let configure = started.elapsed();
 
@@ -479,7 +486,7 @@ impl Config {
                 let started = std::time::Instant::now();
                 let service = svc::NewService::new_service(&stack, target);
                 metrics.observe_stack_build(configure, layers, started.elapsed());
-                if shared {
+                if share_this_session {
                     metrics.session_stack_cache_misses.inc();
                     let mut cache = cache.lock();
                     if cache.len() >= CACHE_CAP {

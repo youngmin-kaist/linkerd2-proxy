@@ -25,5 +25,5 @@ pub struct Dmesh {
     pub metrics: std::sync::Arc<SessionMetrics>,
 }
 
-pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle, DrainState};
+pub use io::{dmesh_io_pair, BackendRoute, DmeshIo, DmeshIoHandle, DrainState};
 pub use metrics::{record_control_event, SessionMetrics};

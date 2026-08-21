@@ -66,6 +66,14 @@ impl<E: Param<Remote<ServerAddr>>> Param<Remote<ServerAddr>> for SessionEndpoint
 
 impl<E: Param<tls::ConditionalClientTls>> Param<tls::ConditionalClientTls> for SessionEndpoint<E> {
     fn param(&self) -> tls::ConditionalClientTls {
+        /* A DMA session reaches another DPU through the authenticated peer
+         * channel. Layering Linkerd workload TLS or its transport header over
+         * DmeshIo would deliver proxy ciphertext to the destination Pod,
+         * because the destination deliberately runs only the inbound policy
+         * verdict and not a second byte-stream proxy. */
+        if self.session.0.is_some() {
+            return tls::ConditionalClientTls::None(tls::NoClientTls::Disabled);
+        }
         self.endpoint.param()
     }
 }
@@ -149,6 +157,31 @@ mod tests {
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct TlsEndpoint;
+
+    impl svc::Param<tls::ConditionalClientTls> for TlsEndpoint {
+        fn param(&self) -> tls::ConditionalClientTls {
+            tls::ConditionalClientTls::None(tls::NoClientTls::NotProvidedByServiceDiscovery)
+        }
+    }
+
+    #[test]
+    fn dma_session_disables_endpoint_tls() {
+        let token = dmesh_doca::SessionToken::new(1, 2, 3);
+        let dma = SessionEndpoint::new(TlsEndpoint, SessionHandle(Some(token.into())));
+        assert!(matches!(
+            svc::Param::<tls::ConditionalClientTls>::param(&dma),
+            tls::ConditionalClientTls::None(tls::NoClientTls::Disabled)
+        ));
+
+        let socket = SessionEndpoint::new(TlsEndpoint, SessionHandle(None));
+        assert!(matches!(
+            svc::Param::<tls::ConditionalClientTls>::param(&socket),
+            tls::ConditionalClientTls::None(tls::NoClientTls::NotProvidedByServiceDiscovery)
+        ));
+    }
 
     /// The session survives the protocol-detection wrappers on the server-side
     /// I/O and arrives at the connect stack, paired with the endpoint by the

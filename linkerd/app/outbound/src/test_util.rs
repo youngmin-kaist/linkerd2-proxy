@@ -27,8 +27,6 @@ pub(crate) fn default_config() -> Config {
         dmesh_session: None,
         #[cfg(feature = "doca")]
         dmesh_origin: false,
-        #[cfg(feature = "doca")]
-        dmesh_shared_stacks: false,
         allow_discovery: IpMatch::new(Some(IpNet::from_str("0.0.0.0/0").unwrap())).into(),
         proxy: config::ProxyConfig {
             server: config::ServerConfig {

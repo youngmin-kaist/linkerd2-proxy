@@ -107,6 +107,10 @@ fn dmesh_channel(
                 %bound,
                 "Connection carried a session other than the one its stack is bound to"
             );
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("dmesh session mismatch: connection {carried}, stack {bound}"),
+            ));
         }
     }
     let Some(session) = handed.or(baked) else {
@@ -377,11 +381,9 @@ mod dmesh_tests {
         assert_eq!(d.metrics.backend_session_mismatches.get(), 0);
     }
 
-    /// The carried session wins over the baked one, and the disagreement is
-    /// counted: on a single-session stack the two must match, so a nonzero
-    /// counter marks broken plumbing.
+    /// A single-session stack must never consume another session's backend.
     #[test]
-    fn a_carried_session_overrides_the_baked_one_and_is_counted() {
+    fn a_carried_session_mismatch_is_refused() {
         let d = dmesh();
         let addr: SocketAddr = "10.96.0.11:9092".parse().unwrap();
         let baked_session = SessionToken::new(0, 0, 0);
@@ -389,19 +391,16 @@ mod dmesh_tests {
         publish(&d, addr, baked_session);
         publish(&d, addr, carried_session);
 
-        dmesh_channel(
+        let error = dmesh_channel(
             Some(&d),
             Some(baked_session),
             SessionHandle(Some(carried_session.into())),
             true,
             addr,
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            d.backends.take_session(carried_session, addr).unwrap_err(),
-            dmesh_doca::TakeError::AlreadyTaken
-        );
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        d.backends.take_session(carried_session, addr).unwrap();
         d.backends.take_session(baked_session, addr).unwrap();
         assert_eq!(d.metrics.backend_session_mismatches.get(), 1);
     }

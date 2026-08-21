@@ -103,13 +103,6 @@ pub struct Config {
     /// dial to a DMesh-provided address fail instead of falling back to TCP.
     #[cfg(feature = "doca")]
     pub dmesh_origin: bool,
-
-    /// Share one DMesh outbound stack among all of a workload's sessions
-    /// instead of building one per session. Connections resolve their backend
-    /// channels through the session they carry, so nothing in the shared
-    /// stack depends on which session is dialing.
-    #[cfg(feature = "doca")]
-    pub dmesh_shared_stacks: bool,
 }
 
 #[derive(Clone, Debug)]

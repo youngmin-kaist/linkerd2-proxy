@@ -22,6 +22,7 @@ mod tests;
 pub struct Connect<T> {
     version: http::Variant,
     inner: T,
+    session: crate::tcp::session::SessionHandle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,13 +53,21 @@ impl<C> Outbound<C> {
         C::Metadata: Send + Unpin,
         C::Future: Send + Unpin + 'static,
     {
-        self.map_stack(|_, _, inner| {
+        self.map_stack(|_config, _, inner| {
+            #[cfg(feature = "doca")]
+            let session = crate::tcp::session::SessionHandle(_config.dmesh_session.map(Into::into));
+            #[cfg(not(feature = "doca"))]
+            let session = crate::tcp::session::SessionHandle(None);
             // Initiates an HTTP client on the underlying transport. Prior-knowledge HTTP/2
             // is typically used (i.e. when communicating with other proxies); though
             // HTTP/1.x fallback is supported as needed.
             svc::stack(inner.into_inner().into_service())
                 .check_service::<Connect<T>>()
-                .push_map_target(|(version, inner)| Connect { version, inner })
+                .push_map_target(move |(version, inner)| Connect {
+                    version,
+                    inner,
+                    session,
+                })
                 .push(http::client::layer())
                 .push_on_service(svc::MapErr::layer_boxed())
                 .check_service::<T>()
@@ -204,13 +213,13 @@ impl<T: svc::Param<Remote<ServerAddr>>> svc::Param<Remote<ServerAddr>> for Conne
     }
 }
 
-/// HTTP client connections are pooled per endpoint and may carry requests from
-/// any session, so they never dial on behalf of one; a single-session stack
-/// reaches its channel through the session baked into its connector.
+/// Protocol-aware DMA stacks are session-local, so their HTTP connection pool
+/// carries the same baked session all the way through TLS and into the physical
+/// connector. Socket stacks carry none.
 impl<T> svc::Param<crate::tcp::session::SessionHandle> for Connect<T> {
     #[inline]
     fn param(&self) -> crate::tcp::session::SessionHandle {
-        crate::tcp::session::SessionHandle(None)
+        self.session
     }
 }
 
@@ -219,6 +228,9 @@ impl<T: svc::Param<tls::ConditionalClientTls>> svc::Param<tls::ConditionalClient
 {
     #[inline]
     fn param(&self) -> tls::ConditionalClientTls {
+        if self.session.0.is_some() {
+            return tls::ConditionalClientTls::None(tls::NoClientTls::Disabled);
+        }
         self.inner.param()
     }
 }

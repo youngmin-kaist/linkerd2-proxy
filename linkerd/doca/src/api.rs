@@ -11,6 +11,10 @@ pub struct FlowId {
     pub workload: String,
     /// The connection provides the service at `dst`.
     pub is_backend: bool,
+    /// The frontend is assigned to Linkerd's protocol-aware HTTP stack. These
+    /// connections require session-local endpoint and HTTP/2 transport pools;
+    /// opaque byte streams may share the workload-level stack.
+    pub protocol_aware: bool,
 }
 
 /// Names one session for its whole lifetime.

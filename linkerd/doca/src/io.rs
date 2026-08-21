@@ -28,6 +28,16 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::api::SessionToken;
 
+/// Exact destination selected by Linkerd discovery for backend output.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum BackendRoute {
+    #[default]
+    Any,
+    Origin,
+    Local(i32),
+    Remote(String),
+}
+
 /// Default cap on buffered-but-unsent bytes before writers see backpressure.
 const DEFAULT_TX_CAPACITY: usize = 256 * 1024;
 
@@ -44,6 +54,7 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 
 #[derive(Default)]
 struct Inner {
+    backend_route: BackendRoute,
     /// Owned received bytes (copy path; used by tests and any non-DMA push).
     rx: Vec<u8>,
 
@@ -67,6 +78,8 @@ struct Inner {
     tx_read: usize,
     /// Local half shut down: further writes fail.
     tx_closed: bool,
+    /// The stack dropped the endpoint without an orderly poll_shutdown.
+    tx_aborted: bool,
     tx_waker: Option<Waker>,
     tx_capacity: usize,
 
@@ -144,6 +157,8 @@ pub struct DrainState {
     pub has_rx: bool,
     /// The stack shut its write half and every queued byte has been published.
     pub tx_finished: bool,
+    /// The endpoint disappeared without publishing an orderly output FIN.
+    pub tx_aborted: bool,
 }
 
 // SAFETY: `staging_base` is a raw address into a DMA region that outlives the
@@ -175,6 +190,12 @@ pub fn dmesh_io_pair(peer: SocketAddr, session: Option<SessionToken>) -> (DmeshI
 impl fmt::Debug for DmeshIo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DmeshIo").field("peer", &self.peer).finish()
+    }
+}
+
+impl DmeshIo {
+    pub(crate) fn set_backend_route(&self, route: BackendRoute) {
+        lock(&self.inner).backend_route = route;
     }
 }
 
@@ -287,12 +308,21 @@ impl PeerAddr for DmeshIo {
 impl Drop for DmeshIo {
     fn drop(&mut self) {
         let mut inner = lock(&self.inner);
+        if !inner.tx_closed {
+            inner.tx_aborted = true;
+        }
         inner.tx_closed = true;
         inner.wake_driver();
     }
 }
 
 impl DmeshIoHandle {
+    /// Linkerd's backend choice, installed before the connector hands the IO
+    /// to the stack.
+    pub fn backend_route(&self) -> BackendRoute {
+        lock(&self.inner).backend_route.clone()
+    }
+
     /// Point the reader at the connection's mapped DMA staging region. Must be
     /// set before any `push_segment`.
     pub fn set_staging(&self, base_addr: usize, len: usize) {
@@ -338,6 +368,7 @@ impl DmeshIoHandle {
         inner.rx_closed = true;
         inner.tx_clear();
         inner.tx_closed = true;
+        inner.tx_aborted = true;
         inner.wake_reader();
         inner.wake_writer();
         inner.wake_driver();
@@ -426,6 +457,7 @@ impl DmeshIoHandle {
         DrainState {
             has_rx: inner.rx_has_data(),
             tx_finished: inner.tx_closed && inner.tx_queued() == 0,
+            tx_aborted: inner.tx_aborted,
         }
     }
 

@@ -33,9 +33,9 @@ use tracing::{debug, debug_span, info, warn, Instrument};
 /// Server-side target for a DMA-received connection. Mirrors the `Param` impls
 /// of `linkerd_proxy_transport::orig_dst::Addrs` that the outbound stack reads.
 ///
-/// The application uses the session to build one complete DMesh-only outbound
-/// stack. Every cache in that stack is therefore scoped to this session even
-/// though the stock Linkerd target types continue to key by destination.
+/// Protocol-aware sessions build a complete session-local outbound stack so
+/// HTTP connection pools cannot cross DMA session boundaries. Opaque sessions
+/// may reuse a workload-level stack and carry their token with the byte stream.
 #[derive(Clone, Debug)]
 pub struct DmeshTarget {
     orig_dst: OrigDstAddr,
@@ -45,6 +45,7 @@ pub struct DmeshTarget {
     /// proxy serves many workloads, so this cannot be the process-wide policy
     /// workload used by an ordinary one-Pod sidecar.
     policy_workload: Arc<str>,
+    protocol_aware: bool,
 }
 
 impl Param<OrigDstAddr> for DmeshTarget {
@@ -79,11 +80,16 @@ impl DmeshTarget {
             client: Remote(ClientAddr(SocketAddr::V4(flow.src))),
             session,
             policy_workload: Arc::from(flow.workload.as_str()),
+            protocol_aware: flow.protocol_aware,
         }
     }
 
     pub(crate) fn policy_workload(&self) -> &Arc<str> {
         &self.policy_workload
+    }
+
+    pub(crate) fn protocol_aware(&self) -> bool {
+        self.protocol_aware
     }
 }
 
@@ -347,6 +353,7 @@ mod tests {
             dst: "10.96.0.11:9092".parse().unwrap(),
             workload: "test".to_string(),
             is_backend: false,
+            protocol_aware: false,
         }
     }
 
@@ -355,6 +362,7 @@ mod tests {
         let flow = flow(1);
         let target = DmeshTarget::new(&flow, SessionToken::new(0, 0, 0));
         assert_eq!(target.policy_workload().as_ref(), "test");
+        assert!(!target.protocol_aware());
     }
 
     fn start<N>(outbound: N) -> Harness
