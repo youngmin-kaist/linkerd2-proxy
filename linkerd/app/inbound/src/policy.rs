@@ -176,6 +176,22 @@ impl AllowPolicy {
         connection_verdict(&self.server.borrow(), client, tls)
     }
 
+    /// Whether the policy controller has answered for this port.
+    ///
+    /// A port's watch is spawned holding the proxy's configured default and is
+    /// replaced when the controller answers; the two are indistinguishable by
+    /// value, because an answer may itself be a default. A stack does not have
+    /// to tell them apart — it holds the connection while discovery resolves —
+    /// but a caller that decides admission without one does: enforcing on the
+    /// configured default admits a client this port's own policy refuses.
+    ///
+    /// Evaluating the policy borrows without consuming the update, so this
+    /// stays true once the first answer lands. It is false where the watch has
+    /// no sender at all, which is the same absence of an answer.
+    pub fn discovered(&self) -> bool {
+        self.server.has_changed().unwrap_or(false)
+    }
+
     fn routes(&self) -> Option<Routes> {
         let borrow = self.server.borrow();
         match &borrow.protocol {

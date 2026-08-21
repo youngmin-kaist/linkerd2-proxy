@@ -131,10 +131,48 @@ pub fn dmesh_connection_verdict(
     client: std::net::SocketAddr,
     client_identity: Option<&str>,
 ) -> bool {
+    dmesh_policy_admits(&dmesh_port_policy(store, destination), client, client_identity)
+}
+
+/// One destination port's policy watch.
+///
+/// Holding it is what keeps the watch alive: the store caches watches by port
+/// and evicts one that has gone idle, and an evicted watch is respawned holding
+/// the configured default. A caller that enforces admission has to hold the
+/// watch for as long as it enforces, or its verdicts lapse to the default
+/// whenever the port falls quiet.
+#[cfg(feature = "doca")]
+pub type DmeshPortPolicy = inbound::policy::AllowPolicy;
+
+/// Begin watching one destination port's inbound policy.
+#[cfg(feature = "doca")]
+pub fn dmesh_port_policy(
+    store: &DmeshPolicyStore,
+    destination: std::net::SocketAddr,
+) -> DmeshPortPolicy {
     use inbound::policy::GetPolicy;
+    use linkerd_app_core::transport::OrigDstAddr;
+    store.get_policy(OrigDstAddr(destination))
+}
+
+/// Whether the policy controller has answered for this port yet. A watch it
+/// has not answered still holds this proxy's configured default, which is not
+/// a decision about the port.
+#[cfg(feature = "doca")]
+pub fn dmesh_policy_discovered(policy: &DmeshPortPolicy) -> bool {
+    policy.discovered()
+}
+
+/// Whether one destination port's policy admits a connection.
+#[cfg(feature = "doca")]
+pub fn dmesh_policy_admits(
+    policy: &DmeshPortPolicy,
+    client: std::net::SocketAddr,
+    client_identity: Option<&str>,
+) -> bool {
     use linkerd_app_core::{
         identity, tls,
-        transport::{ClientAddr, OrigDstAddr, Remote},
+        transport::{ClientAddr, Remote},
     };
 
     let client_id = client_identity
@@ -145,9 +183,7 @@ pub fn dmesh_connection_verdict(
         client_id,
         negotiated_protocol: None,
     });
-    store
-        .get_policy(OrigDstAddr(destination))
-        .admits(Remote(ClientAddr(client)), &tls)
+    policy.admits(Remote(ClientAddr(client)), &tls)
 }
 
 #[cfg(feature = "doca")]
