@@ -8,9 +8,10 @@
 //! The registry is owned, not global: each ARM worker builds one and hands it
 //! to its adapter and its connector, so no lock is shared between workers.
 
-use crate::{api::SessionToken, BackendRoute, DmeshIo};
+use crate::{api::SessionToken, dmesh_io_pair, BackendRoute, DmeshIo, DmeshIoHandle};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,7 +37,14 @@ pub enum EndpointVerdict {
 }
 
 /// Resolves an address the balancer selected to a live destination.
-pub type EndpointResolver = Arc<dyn Fn(SocketAddr) -> EndpointVerdict + Send + Sync>;
+///
+/// The second argument is the session's own service address, because
+/// `SessionOwn` is a statement about *this* session: every other Service's
+/// address has to resolve to an endpoint like any other destination, or a
+/// route that crossed Services would land on the original Service's backend
+/// with no error and no counter.
+pub type EndpointResolver =
+    Arc<dyn Fn(SocketAddr, SocketAddr) -> EndpointVerdict + Send + Sync>;
 
 /// Identifies one session's backend channel.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -120,8 +128,13 @@ impl std::error::Error for TakeError {}
 #[derive(Debug)]
 struct Entry {
     service: SocketAddr,
-    /// `None` once a connector has taken the channel.
+    /// The channel published when the session opened. `None` once the first
+    /// endpoint has claimed it; a later endpoint is minted its own.
     io: Option<DmeshIo>,
+    /// Endpoints this session has already been dialled for. A repeat of one of
+    /// them is `AlreadyTaken`, which is what that error has always meant; a
+    /// new one is a second backend, which is not an error at all.
+    taken: HashSet<SocketAddr>,
 }
 
 #[derive(Default)]
@@ -139,6 +152,11 @@ struct Registry {
     /// authoritative.
     #[allow(clippy::type_complexity)]
     endpoints: Option<EndpointResolver>,
+    /// Endpoints minted here and not yet collected by the worker that owns the
+    /// session. The connector runs on its own task, so the handle it creates
+    /// reaches the worker the same way a client endpoint's does: queued, and
+    /// picked up on the worker's next pass.
+    minted: Vec<(SessionToken, DmeshIoHandle)>,
 }
 
 impl fmt::Debug for Registry {
@@ -156,6 +174,10 @@ impl fmt::Debug for Registry {
 #[derive(Debug, Default)]
 pub struct Backends {
     registry: Mutex<Registry>,
+    /// Whether `minted` holds anything. The worker asks once per pass, and
+    /// almost every pass has nothing to collect, so the question is answered
+    /// without taking the registry lock.
+    minted_pending: AtomicBool,
 }
 
 impl Backends {
@@ -184,6 +206,7 @@ impl Backends {
             Entry {
                 service: key.service,
                 io: Some(io),
+                taken: HashSet::new(),
             },
         );
         Ok(())
@@ -191,16 +214,23 @@ impl Backends {
 
     /// Take the backend channel owned by one session.
     ///
-    /// Linkerd discovery may replace the Service ClusterIP with a concrete
-    /// endpoint, but it may not move a DMesh session to another Service. The
-    /// newest signed generation decides: an address it places in another
-    /// Service is a mismatch.
+    /// A route may send a stream into another Service — that is what a
+    /// weighted `backendRefs` is — so Service identity is not what guards this
+    /// dial. Liveness and node placement are: once endpoints are
+    /// authoritative, every address other than the session's own must resolve
+    /// to a live local Pod or to one the generation places on another node,
+    /// and an endpoint that does neither is declined by the reason it failed
+    /// for, never round-robined and never dialled over TCP.
     ///
-    /// Once endpoints are authoritative, an address the snapshot does not
-    /// place is no longer assumed to be this session's. The session's own
-    /// addresses resolve as such, and everything else must resolve to a live
-    /// destination — an endpoint that does not is declined by the reason it
-    /// failed for, never round-robined and never dialled over TCP.
+    /// The Service placement remains the guard where no resolver has been
+    /// installed yet, because then nothing else can tell one Service's address
+    /// from another's.
+    ///
+    /// A session may be dialled for more than one endpoint. The first takes
+    /// the channel published when the session opened; each later endpoint is
+    /// minted its own, and its handle is queued for the worker. `AlreadyTaken`
+    /// therefore means what it says — this endpoint was dialled twice — rather
+    /// than "this session already has a backend".
     pub fn take_session(
         &self,
         session: SessionToken,
@@ -211,15 +241,17 @@ impl Backends {
             return Err(TakeError::NotPublished);
         };
         let service = entry.service;
-        if registry
-            .service_of_target
-            .get(&selected_target)
-            .is_some_and(|placed| *placed != service)
+        let resolver = registry.endpoints.clone();
+        if resolver.is_none()
+            && registry
+                .service_of_target
+                .get(&selected_target)
+                .is_some_and(|placed| *placed != service)
         {
             return Err(TakeError::TargetMismatch);
         }
-        let route = if let Some(resolve) = registry.endpoints.clone() {
-            match resolve(selected_target) {
+        let route = if let Some(resolve) = resolver {
+            match resolve(selected_target, service) {
                 EndpointVerdict::SessionOwn => BackendRoute::Any,
                 EndpointVerdict::Live(pod) => BackendRoute::Local(pod),
                 EndpointVerdict::Unresolved => return Err(TakeError::EndpointUnresolved),
@@ -229,13 +261,43 @@ impl Backends {
         } else {
             BackendRoute::Any
         };
+        let mut minted = None;
         let entry = registry
             .by_session
             .get_mut(&session)
             .expect("the session entry was just read");
-        let io = entry.io.take().ok_or(TakeError::AlreadyTaken)?;
+        if !entry.taken.insert(selected_target) {
+            return Err(TakeError::AlreadyTaken);
+        }
+        let io = match entry.io.take() {
+            Some(io) => io,
+            None => {
+                let (io, handle) = dmesh_io_pair(selected_target, Some(session));
+                minted = Some(handle);
+                io
+            }
+        };
+        // The pair shares one state, so the route the io carries is the route
+        // the handle reports.
         io.set_backend_route(route);
+        if let Some(handle) = minted {
+            registry.minted.push((session, handle));
+            self.minted_pending.store(true, Ordering::Release);
+        }
         Ok(io)
+    }
+
+    /// Take the endpoints minted since the last call, for the worker to adopt.
+    ///
+    /// A second endpoint is rare and this is asked on every worker pass, so a
+    /// pass with nothing to collect never reaches the lock. A mint that lands
+    /// while this is draining sets the flag again and is collected next pass,
+    /// which is the same latency a mint already has.
+    pub fn take_minted(&self) -> Vec<(SessionToken, DmeshIoHandle)> {
+        if !self.minted_pending.swap(false, Ordering::Acquire) {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.registry().minted)
     }
 
     /// Install the newest signed view of which Service each address belongs to.
@@ -482,6 +544,122 @@ mod tests {
             Some(TakeError::NotPublished)
         );
         assert_eq!(backends.len(), 7);
+    }
+
+    // A resolver is what makes an endpoint authoritative, and once one is
+    // installed Service identity stops guarding the dial: a route is allowed
+    // to cross Services, and liveness is what refuses.
+    #[test]
+    fn a_route_may_cross_services_when_the_endpoint_is_live() {
+        let backends = Backends::new();
+        let service = addr(13);
+        let other_service = addr(99);
+        let other_endpoint = SocketAddr::from(([10, 244, 0, 99], 9092));
+        let token = SessionToken::new(2, 7, 4);
+        let (published, handle) = dmesh_io_pair(service, None);
+        backends
+            .publish(BackendKey::new(service, token), published)
+            .unwrap();
+        backends.place_targets([
+            (other_service, other_service),
+            (other_endpoint, other_service),
+        ]);
+        backends.set_endpoint_resolver(Arc::new(move |selected, session_service| {
+            assert_eq!(session_service, service, "the resolver is told whose session");
+            if selected == other_endpoint {
+                EndpointVerdict::Live(7)
+            } else {
+                EndpointVerdict::Unresolved
+            }
+        }));
+
+        backends.take_session(token, other_endpoint).unwrap();
+        assert_eq!(handle.backend_route(), BackendRoute::Local(7));
+    }
+
+    #[test]
+    fn a_foreign_service_address_is_not_this_session() {
+        let backends = Backends::new();
+        let service = addr(13);
+        let other_service = addr(99);
+        let token = SessionToken::new(1, 1, 1);
+        backends
+            .publish(BackendKey::new(service, token), io(service))
+            .unwrap();
+        // The resolver decides ownership now, and a resolver built for one
+        // session answers `SessionOwn` for that session's addresses only.
+        backends.set_endpoint_resolver(Arc::new(move |selected, session_service| {
+            if selected == session_service {
+                EndpointVerdict::SessionOwn
+            } else {
+                EndpointVerdict::Unresolved
+            }
+        }));
+
+        assert_eq!(
+            backends.take_session(token, other_service).err(),
+            Some(TakeError::EndpointUnresolved),
+            "a foreign Service address must resolve like any other endpoint"
+        );
+    }
+
+    #[test]
+    fn a_crossing_route_still_needs_a_live_endpoint() {
+        let backends = Backends::new();
+        let service = addr(13);
+        let dead = SocketAddr::from(([10, 244, 0, 98], 9092));
+        let token = SessionToken::new(3, 3, 3);
+        backends
+            .publish(BackendKey::new(service, token), io(service))
+            .unwrap();
+        backends.place_targets([(dead, addr(99))]);
+        backends.set_endpoint_resolver(Arc::new(|_, _| EndpointVerdict::Stale));
+
+        assert_eq!(
+            backends.take_session(token, dead).err(),
+            Some(TakeError::EndpointStale)
+        );
+    }
+
+    #[test]
+    fn a_second_endpoint_is_minted_rather_than_refused() {
+        // Spread across endpoints is the whole point: a session that has to
+        // reach two backends gets two channels, and `AlreadyTaken` goes back
+        // to meaning that one endpoint was dialled twice.
+        let backends = Backends::new();
+        let service = addr(13);
+        let first = SocketAddr::from(([10, 244, 0, 11], 9092));
+        let second = SocketAddr::from(([10, 244, 0, 12], 9092));
+        let token = SessionToken::new(1, 1, 1);
+        let (published, published_handle) = dmesh_io_pair(service, Some(token));
+        backends
+            .publish(BackendKey::new(service, token), published)
+            .unwrap();
+        backends.set_endpoint_resolver(Arc::new(move |selected, _| {
+            if selected == first {
+                EndpointVerdict::Live(7)
+            } else if selected == second {
+                EndpointVerdict::Live(9)
+            } else {
+                EndpointVerdict::Unresolved
+            }
+        }));
+
+        backends.take_session(token, first).unwrap();
+        assert_eq!(published_handle.backend_route(), BackendRoute::Local(7));
+        assert!(backends.take_minted().is_empty(), "the first takes what exists");
+
+        backends.take_session(token, second).unwrap();
+        let minted = backends.take_minted();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].0, token);
+        assert_eq!(minted[0].1.backend_route(), BackendRoute::Local(9));
+
+        assert_eq!(
+            backends.take_session(token, first).err(),
+            Some(TakeError::AlreadyTaken),
+            "the same endpoint twice is still a repeat"
+        );
     }
 
     #[test]
