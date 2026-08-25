@@ -1,0 +1,10 @@
+nohup: ignoring input
+mock policy serving on 127.0.0.1:8087
+inbound policy: all-unauthenticated
+outbound policy: forward to 127.0.0.1:8086
+inbound watch_port workload=local-dev port=4191
+inbound watch_port workload=local-dev port=8086
+outbound watch target=Some(Addr(TcpAddress { ip: Some(IpAddress { ip: Some(Ipv4(2130706433)) }), port: 8086 })) backend=127.0.0.1:8086
+inbound watch_port workload=local-dev port=4191
+inbound watch_port workload=local-dev port=8086
+outbound watch target=Some(Addr(TcpAddress { ip: Some(IpAddress { ip: Some(Ipv4(2130706433)) }), port: 8086 })) backend=127.0.0.1:8086

@@ -4,6 +4,7 @@
 resolver = "2"
 
 members = [
+    "dmesh-router",
     "hyper-balance",
     "linkerd/addr",
     "linkerd/app/admin",
@@ -31,6 +32,7 @@ members = [
     "linkerd/http/classify",
     "linkerd/http/detect",
     "linkerd/http/h2",
+    "linkerd/http/nghttp2",
     "linkerd/http/insert",
     "linkerd/http/metrics",
     "linkerd/http/override-authority",
@@ -144,3 +146,10 @@ version = "0.20.0"
 version = "0.10"
 default-features = false
 features = ["std", "std_rng", "sys_rng"]
+
+# Local fork of hyper for DPUMesh experiments (vendored from crates.io 1.10.1).
+# All graph edges to hyper@1.x now resolve to this path; edit vendor/hyper/src
+# and cargo rebuilds dependents automatically.
+[patch.crates-io]
+hyper = { path = "vendor/hyper" }
+h2 = { path = "vendor/h2" }

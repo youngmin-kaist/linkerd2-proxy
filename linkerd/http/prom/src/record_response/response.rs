@@ -66,13 +66,14 @@ impl<L> Clone for ResponseMetrics<L> {
 
 // === impl RecordResponseDuration ===
 
-impl<M, S> svc::Service<http::Request<BoxBody>> for RecordResponseDuration<M, S>
+impl<M, S, RspB> svc::Service<http::Request<BoxBody>> for RecordResponseDuration<M, S>
 where
     M: MkStreamLabel,
     M::DurationLabels: LabelSet,
-    S: svc::Service<http::Request<BoxBody>, Response = http::Response<BoxBody>, Error = Error>,
+    RspB: http_body::Body,
+    S: svc::Service<http::Request<BoxBody>, Response = http::Response<RspB>, Error = Error>,
 {
-    type Response = http::Response<BoxBody>;
+    type Response = http::Response<super::ResponseBody<M::StreamLabel, RspB>>;
     type Error = Error;
     type Future = super::ResponseFuture<M::StreamLabel, S::Future>;
 

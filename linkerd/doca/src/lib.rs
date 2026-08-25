@@ -25,18 +25,21 @@ pub mod backend {
         sync::{Mutex, OnceLock},
     };
 
-    fn reg() -> &'static Mutex<HashMap<SocketAddr, DmeshIo>> {
-        static R: OnceLock<Mutex<HashMap<SocketAddr, DmeshIo>>> = OnceLock::new();
+    fn reg() -> &'static Mutex<HashMap<SocketAddr, Vec<DmeshIo>>> {
+        static R: OnceLock<Mutex<HashMap<SocketAddr, Vec<DmeshIo>>>> = OnceLock::new();
         R.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// Multiple channels may serve one address (one per DPU worker in
+    /// N-driver mode); each is handed out once, in LIFO order.
     pub fn publish(addr: SocketAddr, io: DmeshIo) {
         tracing::info!(%addr, "dmesh backend channel published");
-        reg().lock().unwrap().insert(addr, io);
+        reg().lock().unwrap().entry(addr).or_default().push(io);
     }
 
     pub fn take(addr: &SocketAddr) -> Option<DmeshIo> {
-        let io = reg().lock().unwrap().remove(addr);
+        let mut reg = reg().lock().unwrap();
+        let io = reg.get_mut(addr).and_then(|v| v.pop());
         if io.is_some() {
             tracing::info!(%addr, "dmesh backend channel taken by connector");
         }
@@ -44,7 +47,7 @@ pub mod backend {
     }
 
     pub fn contains(addr: &SocketAddr) -> bool {
-        reg().lock().unwrap().contains_key(addr)
+        reg().lock().unwrap().get(addr).map(|v| !v.is_empty()).unwrap_or(false)
     }
 }
 

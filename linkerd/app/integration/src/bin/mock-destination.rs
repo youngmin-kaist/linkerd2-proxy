@@ -81,8 +81,12 @@ impl destination_server::Destination for Destination {
     ) -> Result<Response<Self::GetProfileStream>, Status> {
         let req = req.into_inner();
         eprintln!("destination get_profile path={}", req.path);
+        // MOCK_DEST_OPAQUE=1 marks the destination opaque so the outbound stack
+        // byte-forwards (L4) instead of terminating HTTP/2 — used to measure the
+        // proxy's cost with the h2 stack bypassed (h2load<->nginx h2 end-to-end).
         let profile = destination::DestinationProfile {
             fully_qualified_name: req.path,
+            opaque_protocol: std::env::var("MOCK_DEST_OPAQUE").is_ok(),
             ..Default::default()
         };
         let stream = stream::once(async move { Ok(profile) }).chain(stream::pending());

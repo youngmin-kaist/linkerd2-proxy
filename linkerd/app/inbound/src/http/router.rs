@@ -247,6 +247,9 @@ impl<C> Inbound<C> {
                     LogicalPerRequest::from(t)
                 }))
                 .push(self::metrics::layer(&rt.metrics))
+                // P1: the metrics layers above no longer box response bodies
+                // at every recording layer; box once here instead.
+                .push_on_service(http::BoxResponse::layer())
                 .check_new_service::<policy::Permitted<T>, http::Request<http::BoxBody>>()
                 .push(svc::ArcNewService::layer())
                 .push(policy::NewHttpPolicy::layer(rt.metrics.http_authz.clone()))

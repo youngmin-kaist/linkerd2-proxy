@@ -1,7 +1,7 @@
 use super::{DurationFamily, MkDurationHistogram};
 use crate::stream_label::{LabelSet, MkStreamLabel};
 use linkerd_error::Error;
-use linkerd_http_box::BoxBody;
+
 use linkerd_stack as svc;
 use prometheus_client::registry::{Registry, Unit};
 use std::{
@@ -63,14 +63,15 @@ impl<L> Clone for RequestMetrics<L> {
 
 // === impl RecordRequestDuration ===
 
-impl<ReqB, L, S> svc::Service<http::Request<ReqB>> for RecordRequestDuration<L, S>
+impl<ReqB, RspB, L, S> svc::Service<http::Request<ReqB>> for RecordRequestDuration<L, S>
 where
     L: MkStreamLabel,
     L::StatusLabels: LabelSet,
     L::DurationLabels: LabelSet,
-    S: svc::Service<http::Request<ReqB>, Response = http::Response<BoxBody>, Error = Error>,
+    RspB: http_body::Body,
+    S: svc::Service<http::Request<ReqB>, Response = http::Response<RspB>, Error = Error>,
 {
-    type Response = http::Response<BoxBody>;
+    type Response = http::Response<super::ResponseBody<L::StreamLabel, RspB>>;
     type Error = S::Error;
     type Future = super::ResponseFuture<L::StreamLabel, S::Future>;
 

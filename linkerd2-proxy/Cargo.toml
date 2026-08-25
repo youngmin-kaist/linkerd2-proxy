@@ -11,6 +11,11 @@ description = "The main proxy executable"
 default = ["allow-loopback", "doca"]
 allow-loopback = ["linkerd-app/allow-loopback"]
 doca = ["dmesh-doca", "linkerd-app/doca"]
+# tokio-console diagnostics. OFF by default: the tokio "tracing" feature
+# instruments every task poll, which costs throughput on the hot path even
+# with no subscriber attached (~2.4x at warn). Build with
+# `--features tokio-console` only for a diagnostic session, never for benches.
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 meshtls-rustls-aws-lc-fips = ["linkerd-rustls/rustls-aws-lc-fips"]
 log-streaming = ["linkerd-app/log-streaming"]
 pprof = ["linkerd-app/pprof"]
@@ -30,6 +35,7 @@ linkerd-rustls = { path = "../linkerd/rustls" }
 linkerd-signal = { path = "../linkerd/signal" }
 num_cpus = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net"] }
+console-subscriber = { version = "0.4", optional = true }
 tracing = { workspace = true }
 
 [target.x86_64-unknown-linux-gnu.dependencies]

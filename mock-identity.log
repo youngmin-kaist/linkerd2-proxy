@@ -1,0 +1,5 @@
+nohup: ignoring input
+mock identity serving on 127.0.0.1:8088
+using certificate fixture /home/youngmin/DPUMesh/linkerd2-proxy/linkerd/app/integration/src/data/default-default/ca1-cert.pem
+certifying identity default.default.serviceaccount.identity.linkerd.cluster.local
+certifying identity default.default.serviceaccount.identity.linkerd.cluster.local

@@ -432,7 +432,7 @@ int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 	/* Backend channels (안 2): push with this connection's doca_dma engine -
 	 * no rcv_ring, no host DPA. One <=8KB batch outstanding; the driver
 	 * retries the remainder on later ticks. */
-	if (conn->flow.mode == DMESH_FLOW_MODE_BACKEND) {
+	if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
 		if (!conn->reverse_exported || conn->tx_staging == NULL)
 			return -(int32_t)DOCA_ERROR_BAD_STATE;
 		while (sent < len) {
@@ -503,24 +503,27 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 
 	*handle = NULL;
 
-	/* register a logger backend */
-	result = doca_log_backend_create_standard();
-	if (result != DOCA_SUCCESS) {
-		fprintf(stderr, "Failed to create standard log backend: %s\n", doca_error_get_name(result));
-		return result;
+	/* register logger backends once per process (N-driver mode calls
+	 * dmesh_doca_init once per worker) */
+	static bool log_inited = false;
+	if (!log_inited) {
+		result = doca_log_backend_create_standard();
+		if (result != DOCA_SUCCESS) {
+			fprintf(stderr, "Failed to create standard log backend: %s\n", doca_error_get_name(result));
+			return result;
+		}
+		result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+		if (result != DOCA_SUCCESS) {
+			fprintf(stderr, "Failed to create log backend for SDK: %s\n", doca_error_get_name(result));
+			return result;
+		}
+		result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+		if (result != DOCA_SUCCESS) {
+			fprintf(stderr, "Failed to set log level for SDK log backend: %s\n", doca_error_get_name(result));
+			return result;
+		}
+		log_inited = true;
 	}
-
-    /* register a logger backend for internal SDK errors and warnings */
-	result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
-	if (result != DOCA_SUCCESS) {
-		fprintf(stderr, "Failed to create log backend for SDK: %s\n", doca_error_get_name(result));
-		return result;
-	}
-	result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
-    if (result != DOCA_SUCCESS) {
-		fprintf(stderr, "Failed to set log level for SDK log backend: %s\n", doca_error_get_name(result));
-		return result;
-    }
 	
 	objs = calloc(1, sizeof(*objs));
 	if (objs == NULL)

@@ -99,8 +99,9 @@ impl outbound_policies_server::OutboundPolicies for Policy {
         req: Request<outbound::TrafficSpec>,
     ) -> Result<Response<outbound::OutboundPolicy>, Status> {
         let req = req.into_inner();
-        eprintln!("outbound get target={:?} backend={}", req.target, self.backend);
-        Ok(Response::new(forward_policy(self.backend)))
+        let backend = target_backend(&req).unwrap_or(self.backend);
+        eprintln!("outbound get target={:?} backend={}", req.target, backend);
+        Ok(Response::new(forward_policy(backend)))
     }
 
     async fn watch(
@@ -108,13 +109,31 @@ impl outbound_policies_server::OutboundPolicies for Policy {
         req: Request<outbound::TrafficSpec>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let req = req.into_inner();
-        eprintln!(
-            "outbound watch target={:?} backend={}",
-            req.target, self.backend
-        );
-        let policy = forward_policy(self.backend);
+        let backend = target_backend(&req).unwrap_or(self.backend);
+        eprintln!("outbound watch target={:?} backend={}", req.target, backend);
+        let policy = forward_policy(backend);
         let stream = stream::once(async move { Ok(policy) }).chain(stream::pending());
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// MOCK_POLICY_ECHO_TARGET=1: forward each flow to its own original
+/// destination (per-dst sharding, used by the DMA N-driver benchmark where
+/// each ingress/backend channel pair carries a distinct dst key).
+fn target_backend(req: &outbound::TrafficSpec) -> Option<SocketAddr> {
+    if std::env::var("MOCK_POLICY_ECHO_TARGET").is_err() {
+        return None;
+    }
+    use linkerd2_proxy_api::net::ip_address::Ip;
+    match req.target.as_ref()? {
+        outbound::traffic_spec::Target::Addr(a) => {
+            let ip = match a.ip.as_ref()?.ip.as_ref()? {
+                Ip::Ipv4(v4) => std::net::IpAddr::from(v4.to_be_bytes()),
+                Ip::Ipv6(_) => return None,
+            };
+            Some(SocketAddr::new(ip, a.port as u16))
+        }
+        _ => None,
     }
 }
 
@@ -141,6 +160,22 @@ fn forward_policy(addr: SocketAddr) -> outbound::OutboundPolicy {
             for route in &mut opaque.routes {
                 replace_opaque_route_backends(route, addr);
             }
+        }
+    }
+
+    // MOCK_OUTBOUND_OPAQUE=1 replaces the Detect protocol with a BARE Opaque
+    // protocol: the outbound stack then skips HTTP protocol detection and
+    // L4-forwards the connection (no h2 termination), so we can measure the
+    // proxy's cost with the h2 stack fully bypassed.
+    if std::env::var("MOCK_OUTBOUND_OPAQUE").is_ok() {
+        if let Some(outbound::ProxyProtocol {
+            kind: Some(outbound::proxy_protocol::Kind::Detect(detect)),
+        }) = policy.protocol.take()
+        {
+            let opaque = detect.opaque.unwrap_or_default();
+            policy.protocol = Some(outbound::ProxyProtocol {
+                kind: Some(outbound::proxy_protocol::Kind::Opaque(opaque)),
+            });
         }
     }
 
@@ -184,12 +219,42 @@ fn replace_opaque_route_backends(route: &mut outbound::OpaqueRoute, addr: Socket
 }
 
 fn replace_backend(backend: &mut outbound::Backend, addr: SocketAddr) {
+    // MOCK_POLICY_TAGGED_ID=<identity> + MOCK_POLICY_TAGGED_PORT=<port> mark the
+    // endpoint as a meshed peer: the outbound proxy then dials
+    // (endpoint.ip, TAGGED_PORT) with mesh TLS and prepends a
+    // TransportHeader{port: addr.port} — i.e. it sends traffic through a local
+    // "server sidecar" proxy's inbound (direct stack) instead of straight to the
+    // backend. This is what makes a 2-proxy (client+server sidecar) chain work
+    // without iptables. Shape mirrors integration::controller::DestinationBuilder.
+    let tagged = std::env::var("MOCK_POLICY_TAGGED_ID").ok().zip(
+        std::env::var("MOCK_POLICY_TAGGED_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u32>().ok()),
+    );
+    let (protocol_hint, tls_identity) = match tagged {
+        Some((id, inbound_port)) => (
+            Some(destination::ProtocolHint {
+                protocol: None,
+                opaque_transport: Some(destination::protocol_hint::OpaqueTransport {
+                    inbound_port,
+                }),
+            }),
+            Some(destination::TlsIdentity {
+                strategy: Some(destination::tls_identity::Strategy::DnsLikeIdentity(
+                    destination::tls_identity::DnsLikeIdentity { name: id.clone() },
+                )),
+                server_name: Some(destination::tls_identity::DnsLikeIdentity { name: id }),
+            }),
+        ),
+        None => (None, None),
+    };
+
     backend.kind = Some(outbound::backend::Kind::Forward(destination::WeightedAddr {
         addr: Some(addr.try_into().expect("socket addr must convert to protobuf")),
         weight: 1,
         metric_labels: Default::default(),
-        protocol_hint: None,
-        tls_identity: None,
+        protocol_hint,
+        tls_identity,
         authority_override: None,
         http2: None,
         resource_ref: None,

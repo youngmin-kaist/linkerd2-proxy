@@ -1,0 +1,4 @@
+nohup: ignoring input
+mock destination serving on 127.0.0.1:8089
+destination endpoint: 127.0.0.1:8086
+Error: tonic::transport::Error(Transport, Os { code: 98, kind: AddrInUse, message: "Address already in use" })

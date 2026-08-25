@@ -28,6 +28,122 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+
+/// Receive-side cache warming + first-touch latency probe, both env-gated for
+/// A/B measurement. DMA writes into the staging region are IO-coherent but do
+/// NOT allocate into the A78 caches (no DDIO analogue on the DPU side), so the
+/// reader's first touch of a segment is a DRAM-latency miss. `push_segment`
+/// runs at completion time, well before the woken reader task actually copies
+/// the bytes — a prefetch issued here has microseconds to land.
+mod seg_cache {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    /// `DMESH_PREFETCH=1`: warm segments into L2/LLC at completion time.
+    pub(super) fn prefetch_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DMESH_PREFETCH").is_some())
+    }
+
+    fn probe_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DMESH_TOUCH_PROBE").is_some())
+    }
+
+    /// PLDL2KEEP, not L1: the reading task may be scheduled on another core,
+    /// so stop at the cluster-shared level instead of polluting this core's
+    /// L1. Capped at 2KB — once the head lines hit, the hardware streamer
+    /// follows the rest of a sequential copy.
+    #[inline]
+    pub(super) fn prefetch(base: *const u8, len: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let lines = (len.min(2048) + 63) / 64;
+            for i in 0..lines {
+                unsafe {
+                    core::arch::asm!(
+                        "prfm pldl2keep, [{0}]",
+                        in(reg) base.add(i * 64),
+                        options(nostack, preserves_flags, readonly)
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (base, len);
+    }
+
+    /// `DMESH_EVICT=1`: after the reader fully consumes a segment, clean+
+    /// invalidate its lines (`dc civac`). As an optimization this is expected
+    /// to be null-or-harmful; its purpose is to SIMULATE the many-connection
+    /// regime where staging buffers exceed the LLC and lines are capacity-
+    /// evicted between ring wraps — so the next DMA write's cache behavior
+    /// (and the value of `DMESH_PREFETCH` under cold data) can be measured
+    /// with a single connection. Calibrated on this SoC: post-civac first
+    /// touch ~200ns vs ~21ns warm (harness floor).
+    pub(super) fn evict_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DMESH_EVICT").is_some())
+    }
+
+    #[inline]
+    pub(super) fn evict(base: *const u8, len: usize) {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let lines = (len + 63) / 64;
+            for i in 0..lines {
+                core::arch::asm!(
+                    "dc civac, {0}",
+                    in(reg) base.add(i * 64),
+                    options(nostack, preserves_flags)
+                );
+            }
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (base, len);
+    }
+
+    /// `DMESH_TOUCH_PROBE=1`: sample the latency of the very first load of a
+    /// freshly completed segment (every 64th segment), to establish whether
+    /// DMA'd data is actually cache-cold. Reported as a running mean so cold
+    /// (~DRAM, >100ns) vs warm (~cache, <40ns) is unambiguous. NOTE: the
+    /// isb/dsb/mrs bracket itself costs ~21ns on this SoC — a warm line reads
+    /// as ~21-26ns (overhead-limited), a cold one as ~200ns+.
+    #[inline]
+    pub(super) fn probe(base: *const u8) {
+        if !probe_on() {
+            return;
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        static TICKS: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Relaxed);
+        if n % 64 != 0 {
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let t0: u64;
+            let t1: u64;
+            let freq: u64;
+            // isb orders the counter read against surrounding instructions;
+            // dsb sy after the load waits for the memory access itself, so
+            // t1-t0 brackets the load's completion.
+            core::arch::asm!("isb", "mrs {0}, cntvct_el0", out(reg) t0, options(nostack));
+            core::ptr::read_volatile(base as *const u64);
+            core::arch::asm!("dsb sy", "mrs {0}, cntvct_el0", out(reg) t1, options(nostack));
+            core::arch::asm!("mrs {0}, cntfrq_el0", out(reg) freq, options(nostack));
+            let total = TICKS.fetch_add(t1.wrapping_sub(t0), Relaxed) + t1.wrapping_sub(t0);
+            let samples = n / 64 + 1;
+            if samples % 2048 == 0 {
+                let ns = total as f64 / samples as f64 * 1e9 / freq as f64;
+                eprintln!("[dmesh-touch] first-touch mean {ns:.0} ns over {samples} samples");
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = base;
+    }
+}
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -170,6 +286,10 @@ impl AsyncRead for DmeshIo {
             if inner.seg_read_off >= seg_len {
                 inner.segs.pop_front();
                 inner.seg_read_off = 0;
+                if seg_cache::evict_on() {
+                    // SAFETY: same completed-segment invariant as the copy above.
+                    seg_cache::evict(unsafe { base.add(pos as usize) }, seg_len);
+                }
             }
             return Poll::Ready(Ok(()));
         }
@@ -298,6 +418,15 @@ impl DmeshIoHandle {
     /// to the reading stack (zero-copy: no bytes are moved here).
     pub fn push_segment(&self, pos: u32, len: u32) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.staging_base != 0 {
+            // SAFETY: [pos, pos+len) is a completed DMA segment inside the
+            // mapped staging region (same invariant as poll_read's copy).
+            let src = unsafe { (inner.staging_base as *const u8).add(pos as usize) };
+            seg_cache::probe(src);
+            if seg_cache::prefetch_on() {
+                seg_cache::prefetch(src, len as usize);
+            }
+        }
         inner.segs.push_back((pos, len));
         inner.wake_reader();
     }

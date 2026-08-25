@@ -501,13 +501,32 @@ impl Driver {
         let mut stats_last = Instant::now();
         let mut stats_prev = self.stats();
 
+        // DMESH_BUSY_POLL=1 polls both progress engines in a tight loop instead
+        // of sleeping on their notification fds. Profiling the datapath showed
+        // epoll_pwait taking >50% of the core at saturation: with a request/
+        // response workload each wakeup carries only a message or two, so the
+        // per-wakeup cost (epoll round-trip + PE re-arm) is paid per message
+        // rather than amortized over a batch. Busy-polling trades an always-hot
+        // core for removing that cost. (Mirrors DPUMESH_BUSY_POLL in the C
+        // worker, dpu_worker.c.)
+        let busy_poll = std::env::var("DMESH_BUSY_POLL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        if busy_poll {
+            tracing::info!("dmesh driver: busy-poll mode (progress engines polled, fds unused)");
+        }
+
         loop {
             // Arm first so events pending now (or arriving during the drains
             // below) signal the fds; the eager drain+advance closes the race
             // where a setup step already consumed the awaited event. Both PEs
             // run in PROGRESS_ALL mode, so arming clears prior notifications.
-            check(unsafe { dmesh_doca_ctrl_arm(self.doca.raw()) })?;
-            check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
+            // Busy-poll never waits on the fds, so arming (and its per-iteration
+            // syscall/doorbell cost) is skipped entirely.
+            if !busy_poll {
+                check(unsafe { dmesh_doca_ctrl_arm(self.doca.raw()) })?;
+                check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
+            }
 
             check(unsafe { dmesh_doca_ctrl_drain(self.doca.raw()) })?;
             let mut drained: c_int = 0;
@@ -532,6 +551,14 @@ impl Driver {
             // Budget exhausted: more data-path work is pending, don't sleep
             // (but yield so other tasks on this runtime can make progress).
             if drained >= DATA_DRAIN_BUDGET {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // Busy-poll: never block on the notification fds. Yield so the
+            // connection tasks sharing this current_thread runtime run (they
+            // produce the tx bytes this loop publishes), then poll again.
+            if busy_poll {
                 tokio::task::yield_now().await;
                 continue;
             }

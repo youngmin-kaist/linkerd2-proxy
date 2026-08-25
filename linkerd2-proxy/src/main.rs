@@ -21,14 +21,35 @@ mod rt;
 
 const EX_USAGE: i32 = 64;
 
-fn main() {
-    let trace = match trace::Settings::from_env().init() {
+/// Initialize linkerd's fmt logging subscriber, exiting on a bad config.
+fn init_linkerd_trace() -> trace::Handle {
+    match trace::Settings::from_env().init() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Invalid logging configuration: {e}");
             std::process::exit(EX_USAGE);
         }
+    }
+}
+
+fn main() {
+    // tokio-console is gated behind the `tokio-console` cargo feature, which
+    // is OFF by default because the tokio "tracing" runtime instrumentation it
+    // requires costs throughput on the hot path (~2.4x at warn) even with no
+    // subscriber. Build `--features tokio-console` for a diagnostic session
+    // only. When set, DMESH_TOKIO_CONSOLE takes the single global tracing
+    // dispatcher (console runs its own background runtime, so starting it here
+    // — before ours — is fine) and the app gets a disabled trace handle: you
+    // get console, not proxy logs.
+    #[cfg(feature = "tokio-console")]
+    let trace = if std::env::var_os("DMESH_TOKIO_CONSOLE").is_some() {
+        console_subscriber::init();
+        trace::Handle::disabled()
+    } else {
+        init_linkerd_trace()
     };
+    #[cfg(not(feature = "tokio-console"))]
+    let trace = init_linkerd_trace();
 
     info!(
         "{profile} {version} ({sha}) by {vendor} on {date}",
@@ -72,16 +93,33 @@ fn main() {
         };
         let server_name = std::env::var("LINKERD2_PROXY_DOCA_SERVER_NAME")
             .unwrap_or_else(|_| "DPUMesh0".to_string());
-        match dmesh_doca::DmeshDoca::initialize(&dev_pci_addr, &rep_pci_addr, &server_name) {
-            Ok(doca_handle) => {
-                info!(server = %server_name, "dmesh comch server started");
-                doca_handle
-            }
-            Err(error) => {
-                eprintln!("DOCA comch initialization failure: {error}");
-                std::process::exit(1);
-            }
-        }
+        // DMESH_NUM_WORKERS=W starts W shared-nothing comch servers
+        // ("DPUMesh0".."DPUMesh<W-1>"), each with its own DPA pool and driver —
+        // the Rust mirror of `dpumesh -t W` (dpu_worker.c).
+        let num_workers: usize = std::env::var("DMESH_NUM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+        (0..num_workers)
+            .map(|i| {
+                let name = if num_workers == 1 {
+                    server_name.clone()
+                } else {
+                    format!("DPUMesh{i}")
+                };
+                match dmesh_doca::DmeshDoca::initialize(&dev_pci_addr, &rep_pci_addr, &name) {
+                    Ok(doca_handle) => {
+                        info!(server = %name, "dmesh comch server started");
+                        doca_handle
+                    }
+                    Err(error) => {
+                        eprintln!("DOCA comch initialization failure ({name}): {error}");
+                        std::process::exit(1);
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
     };
 
     let mut metrics = linkerd_metrics::prom::Registry::default();
@@ -107,17 +145,21 @@ fn main() {
         // to the app's dmesh acceptor (spawned after the app is built) so
         // DMA-received connections flow through the real outbound stack.
         #[cfg(feature = "doca")]
-        let dmesh_acceptor = {
-            let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
-            let (driver, registrar) = dmesh_doca::Driver::new(dmesh_doca, dmesh_tx);
-            tokio::spawn(async move {
-                match driver.run().await {
-                    Ok(()) => warn!("dmesh driver exited"),
-                    Err(error) => warn!(%error, "dmesh driver failed"),
-                }
-            });
-            (dmesh_rx, registrar)
-        };
+        let dmesh_acceptors = dmesh_doca
+            .into_iter()
+            .enumerate()
+            .map(|(i, doca)| {
+                let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
+                let (driver, registrar) = dmesh_doca::Driver::new(doca, dmesh_tx);
+                tokio::spawn(async move {
+                    match driver.run().await {
+                        Ok(()) => warn!(worker = i, "dmesh driver exited"),
+                        Err(error) => warn!(worker = i, %error, "dmesh driver failed"),
+                    }
+                });
+                (dmesh_rx, registrar)
+            })
+            .collect::<Vec<_>>();
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         let shutdown_grace_period = config.shutdown_grace_period;
@@ -144,8 +186,7 @@ fn main() {
 
         // Drive DMA-received connections through the outbound stack.
         #[cfg(feature = "doca")]
-        {
-            let (dmesh_rx, registrar) = dmesh_acceptor;
+        for (dmesh_rx, registrar) in dmesh_acceptors {
             app.spawn_dmesh(dmesh_rx, registrar);
         }
 

@@ -36,6 +36,8 @@ pub struct ServeHttp<N> {
     version: Variant,
     http1: hyper::server::conn::http1::Builder,
     http2: hyper::server::conn::http2::Builder<TokioExecutor>,
+    /// Raw params, kept so the nghttp2 engine can consume them directly.
+    h2_params: h2::ServerParams,
     inner: N,
     drain: drain::Watch,
 }
@@ -66,6 +68,7 @@ where
             http2: h2,
             drain,
         } = self.params.extract_param(&target);
+        let h2_params = h2.clone();
         let h2::ServerParams {
             keep_alive,
             flow_control,
@@ -124,8 +127,22 @@ where
             drain,
             http1,
             http2,
+            h2_params,
         }
     }
+}
+
+/// Engine selection, read once at startup.
+fn use_nghttp2() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("DMESH_NGHTTP2").is_some();
+        if on {
+            tracing::info!("HTTP/2 server termination: nghttp2 engine");
+        }
+        on
+    })
 }
 
 // === impl ServeHttp ===
@@ -154,6 +171,7 @@ where
         let drain = self.drain.clone();
         let http1 = self.http1.clone();
         let http2 = self.http2.clone();
+        let h2_params = self.h2_params.clone();
 
         let res = io.peer_addr().map(|pa| {
             let (handle, closed) = ClientHandle::new(pa);
@@ -193,6 +211,35 @@ where
                                 conn.await?;
                             }
                         }
+                    }
+
+                    // Both engines are compiled in; DMESH_NGHTTP2=1 selects the
+                    // nghttp2 one at startup. Same binary either way, so an A/B
+                    // measurement has no build-difference confound.
+                    Variant::H2 if use_nghttp2() => {
+                        // The nghttp2 engine hands the stack `Request<BoxBody>`
+                        // directly, so no BoxRequest/TowerToHyperService/TokioIo
+                        // adapters are needed. Drain is delivered to the engine
+                        // so it can emit GOAWAY and finish in-flight streams.
+                        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                        let drain = drain.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = drain.signaled() => {}
+                                () = closed => {}
+                            }
+                            let _ = tx.send(());
+                        });
+                        linkerd_http_nghttp2::server::serve(
+                            io,
+                            svc,
+                            h2_params,
+                            async move {
+                                let _ = rx.await;
+                            },
+                        )
+                        .await
+                        .map_err(Error::from)?;
                     }
 
                     Variant::H2 => {

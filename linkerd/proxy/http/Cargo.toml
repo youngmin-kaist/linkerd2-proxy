@@ -24,6 +24,7 @@ hyper = { workspace = true, features = [
     "server",
 ] }
 hyper-balance = { path = "../../../hyper-balance" }
+linkerd-http-nghttp2 = { path = "../../http/nghttp2" }
 hyper-util = { workspace = true, default-features = false, features = [
     "client",
     "client-legacy",

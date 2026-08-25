@@ -1,7 +1,7 @@
 use crate::stream_label::{LabelSet, MkStreamLabel, StreamLabel};
-use http_body::Body;
+
 use linkerd_error::Error;
-use linkerd_http_box::BoxBody;
+
 use linkerd_stack as svc;
 use prometheus_client::metrics::{
     family::{Family, MetricConstructor},
@@ -67,14 +67,18 @@ where
 }
 
 /// Notifies the response labeler when the response body is flushed.
+///
+/// Generic over the inner body (rather than holding a `BoxBody`) so that
+/// stacking several recording layers does not re-box the body at every layer;
+/// the stack boxes once at its outermost boundary.
 #[pin_project::pin_project(PinnedDrop)]
-struct ResponseBody<L>
+pub struct ResponseBody<L, B>
 where
     L: StreamLabel,
     L::DurationLabels: LabelSet,
 {
     #[pin]
-    inner: BoxBody,
+    inner: B,
     state: Option<ResponseState<L>>,
 }
 
@@ -180,13 +184,14 @@ where
 
 // === impl ResponseFuture ===
 
-impl<L, F> Future for ResponseFuture<L, F>
+impl<L, F, B> Future for ResponseFuture<L, F>
 where
     L: StreamLabel,
     L::DurationLabels: LabelSet,
-    F: Future<Output = Result<http::Response<BoxBody>, Error>>,
+    B: http_body::Body,
+    F: Future<Output = Result<http::Response<B>, Error>>,
 {
-    type Output = Result<http::Response<BoxBody>, Error>;
+    type Output = Result<http::Response<ResponseBody<L, B>>, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
@@ -204,7 +209,7 @@ where
                 }
                 Poll::Ready(Ok(http::Response::from_parts(
                     head,
-                    BoxBody::new(ResponseBody { inner, state }),
+                    ResponseBody { inner, state },
                 )))
             }
             Err(error) => {
@@ -217,12 +222,14 @@ where
 
 // === impl ResponseBody ===
 
-impl<L> http_body::Body for ResponseBody<L>
+impl<L, B> http_body::Body for ResponseBody<L, B>
 where
     L: StreamLabel,
     L::DurationLabels: LabelSet,
+    B: http_body::Body,
+    B::Error: Into<Error>,
 {
-    type Data = <BoxBody as http_body::Body>::Data;
+    type Data = B::Data;
     type Error = Error;
 
     fn poll_frame(
@@ -233,7 +240,7 @@ where
 
         // Poll the inner body for the next frame.
         let poll = this.inner.as_mut().poll_frame(cx);
-        let frame = futures::ready!(poll);
+        let frame = futures::ready!(poll).map(|res| res.map_err(Into::into));
 
         match &frame {
             Some(Ok(frame)) => {
@@ -258,7 +265,7 @@ where
 }
 
 #[pin_project::pinned_drop]
-impl<L> PinnedDrop for ResponseBody<L>
+impl<L, B> PinnedDrop for ResponseBody<L, B>
 where
     L: StreamLabel,
     L::DurationLabels: LabelSet,
