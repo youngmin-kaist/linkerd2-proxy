@@ -62,3 +62,50 @@ host Xeon 사이드카: busy 코어당 ~20-22k req/s → **DMA proxy는 Arm 1코
 - 단일스레드 locality는 구 런도 CORES=1이므로 요인 아님.
 
 주의: backend 브리지는 기동 후 60초 내 첫 요청 필요 (nginx client_header_timeout).
+
+### 16.6k 재현 시도 (전 요인 소거, 2026-08-26)
+
+구 16.6k 설정(안1+count+m300+싱글코어) 고정, 버전/환경만 교체한 A/B:
+현재 코드 97.9k · Rust만 구버전(40ca7626) 107.6k · host 브리지만 구버전(9ec9a6d) 90.0k ·
+완전 시대재현(acdb56c C+커널+구 Rust+구 host) 98.9k · +debug 로깅 98.9k ·
+EU 파티션(mlx5_1 vhca1, EU96-127) 재생성 후 95.5k.
+→ **16.6k는 어떤 조합으로도 재현 불가 = 당시 testbed 상태의 이상치.** 미검증 변수는
+DMESH_REV_PCI=94:00.0(타 테넌트 점유)뿐. 구버전 바이너리:
+`target/release/linkerd2-proxy.{fabccf2e,40ca7626}`, host `~/dpumesh-old/`.
+
+## ⚠️ 대정정 (2026-08-26): 위 183k/205k/97k 수치는 opaque L4 아티팩트
+
+dmesh 채널은 attach 즉시 accept되어 protocol detection(10s)이 시작되는데, 하네스의
+h2load는 attach 후 12~37초에 첫 바이트를 보냄 → detect ReadTimeout → **opaque 폴백
+→ L4 바이트 파이프**로 측정됨 (admin metrics에 HTTP request_total=0, tcp_read_bytes만
+증가; `linkerd_http_detect: Detected result=Ok(ReadTimeout(10s))` 로그로 확인).
+
+**진짜 h2 종단 L7 수치 (metrics로 request_total 일치 확인, 싱글 Arm 코어, warn 로그):**
+- push(안2) + timed m300: **17,406 req/s** / count -n20000 m300: **17,189 req/s**
+- 구 16.6k와 일치 — "count 측정왜곡" 서사가 오히려 아티팩트였음.
+- opaque 수치(~100-183k)는 DMA transport 상한 참고치로만 유효.
+
+검증 하네스: sb-verify-h2.sh (attach 후 10초 내 발사 + step 6 metrics 판별).
+안1(dpa) 셀은 reverse DPA 셋업(37s)이 listen을 막아 현 구조상 창을 못 맞춤 — C 수정 필요.
+액션: 유휴 attach 채널이 opaque로 굳는 accept-시점 문제는 실 버그 (첫 바이트까지 accept 지연 필요).
+
+## 진짜 L7 코어 스케일링 (2026-08-26, sb-l7.sh, h2 종단 metrics 검증)
+
+accept-first 수정(host_worker.c: 인그레스 TCP accept 후 채널 attach → 감지 창 항상 충족) 후,
+코어별 taskset 피닝, W 워커 × M 페어(-c1 -m300 timed 10s×M 동시):
+
+| cores | W | M | req/s | per-core | h2 검증 |
+|---|---|---|---|---|---|
+| 1 | 1 | 1 | 17.4k | 17.4k | metrics ✓ |
+| 2 | 2 | 2 | 22.2k | 11.1k | metrics ✓ |
+| 4 | 4 | 4 | 39.1k | 9.8k | (크래시로 유실, preflight h2 ✓) |
+| 8 | 8 | 8 | 69.2k | 8.6k | (〃) |
+| 16 | 8 | 16 | **100.0k** | 6.2k | metrics ✓ (1,305,928) |
+| 16 | 16 | 16 | 101.3k | 6.3k | W=16 이득 없음 |
+
+- mpstat: C16에서 DPU busy ~13.6/16 코어 (타 테넌트 포함) — 사실상 코어 포화.
+- 스케일링 서브리니어(16코어에서 5.7×): 워커당 드라이버 폴링 + 런타임 경합 추정, 미규명.
+- 참고: 사이드카 Setup A(호스트 x86)는 304k @ 18코어 공유(≈17k/core). DPUMesh 싱글 Arm
+  코어 17.4k는 x86 사이드카 per-core와 대등하나, 스케일 시 효율이 떨어짐.
+- 순차 연결 종료는 teardown 세그폴트를 확률적으로 유발 → preflight는 1포트만, 측정은
+  동시 종료(timed)로. 측정치는 h2load 완료 후 크래시와 무관.
