@@ -109,3 +109,14 @@ accept-first 수정(host_worker.c: 인그레스 TCP accept 후 채널 attach →
   코어 17.4k는 x86 사이드카 per-core와 대등하나, 스케일 시 효율이 떨어짐.
 - 순차 연결 종료는 teardown 세그폴트를 확률적으로 유발 → preflight는 1포트만, 측정은
   동시 종료(timed)로. 측정치는 h2load 완료 후 크래시와 무관.
+
+### per-core 효율 저하 프로파일링 (2026-08-26)
+
+요청당: cycles 124k→217k(+75%)인데 instructions 118k→127k(+7%)뿐 — 일은 같고 **IPC가
+0.95→0.59로 붕괴**(cache miss/req +54%, ctx switch 34×, 코어 마이그레이션 0→3.9k/s).
+perf 콜그래프: atomics 샘플 11%→21%, 최대 사슬은 요청당 라우트 스택 클론
+(`OneshotRoute → box_clone_sync → LoadShed::clone → Vec<Arc>::clone` = Arc refcount
+fetch-add 폭풍) + `Mutex::lock_contended`. 유휴 스핀은 아님(유휴 CPU ~0%).
+결론: 공유 캐시라인(Arc refcount·공유 메트릭·런타임 상태) 경합 + tokio work-stealing의
+지역성 파괴. 개선안: worker별 독립 current_thread 런타임+피닝, 요청당 Arc 클론 제거,
+메트릭 샤딩. (8×싱글코어 프로세스 A/B는 comch 멀티프로세스 연결 hang으로 보류.)
