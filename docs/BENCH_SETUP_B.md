@@ -139,3 +139,19 @@ fetch-add 폭풍) + `Mutex::lock_contended`. 유휴 스핀은 아님(유휴 CPU 
   클라이언트 쪽이 한계 → 150k는 하한값. 브리지 busy-poll 백오프가 다음 과제.
 - 사용법: DMESH_SHARDED=1 + DMESH_NUM_WORKERS=W(=코어수), LINKERD2_PROXY_CORES=1(메인 rt).
   worker i는 코어 15-i에 피닝.
+
+## 브리지 유휴 백오프 후 최종 곡선 (2026-08-26)
+
+run_host_push_splice에 유휴 백오프(64회 무작업→5µs, 4096회→50µs, 작업 시 리셋;
+DMESH_SPLICE_SPIN=1로 순수 스핀 복귀) — M=16에서 호스트 32 hot 프로세스 경합 해소.
+
+| cores | req/s (sharded+backoff) | per-core | 비고 |
+|---|---|---|---|
+| 1 | 17.2k | 17.2k | 백오프 비용 ~-6% (solo) |
+| 2 | 35.1k | 17.6k | |
+| 4 | 66.7k | 16.7k | |
+| 8 | 120.7k | 15.1k | 호스트 한계 아님(불변) |
+| 16 | **186.9k** | 11.7k | **DPU 16.7/16 완전 포화 — 진짜 상한** |
+
+16코어 스케일링 10.9×. 사이드카 Setup A(호스트 x86 18코어) 304k와 비교: DPU 16 Arm 코어로
+그 61% 처리량을 호스트 코어 소모 없이 제공(호스트는 h2load 부하기 제외 유휴).
