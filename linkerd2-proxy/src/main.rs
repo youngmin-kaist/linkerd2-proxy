@@ -144,22 +144,31 @@ fn main() {
         // the DOCA progress-engine fds). The event stream + registrar are handed
         // to the app's dmesh acceptor (spawned after the app is built) so
         // DMA-received connections flow through the real outbound stack.
+        // DMESH_SHARDED=1: shared-nothing worker threads. Each worker gets a
+        // dedicated OS thread pinned to its own core running a current_thread
+        // runtime that hosts the driver AND every flow it serves — no
+        // work-stealing, no cross-core task migration (mirrors dpu_worker.c).
+        let dmesh_sharded = std::env::var_os("DMESH_SHARDED").is_some();
         #[cfg(feature = "doca")]
-        let dmesh_acceptors = dmesh_doca
-            .into_iter()
-            .enumerate()
-            .map(|(i, doca)| {
-                let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
-                let (driver, registrar) = dmesh_doca::Driver::new(doca, dmesh_tx);
+        let mut dmesh_acceptors = Vec::new();
+        #[cfg(feature = "doca")]
+        let mut dmesh_shards = Vec::new();
+        #[cfg(feature = "doca")]
+        for (i, doca) in dmesh_doca.into_iter().enumerate() {
+            let (dmesh_tx, dmesh_rx) = mpsc::unbounded_channel();
+            let (driver, registrar) = dmesh_doca::Driver::new(doca, dmesh_tx);
+            if dmesh_sharded {
+                dmesh_shards.push((i, driver, dmesh_rx, registrar));
+            } else {
                 tokio::spawn(async move {
                     match driver.run().await {
                         Ok(()) => warn!(worker = i, "dmesh driver exited"),
                         Err(error) => warn!(worker = i, %error, "dmesh driver failed"),
                     }
                 });
-                (dmesh_rx, registrar)
-            })
-            .collect::<Vec<_>>();
+                dmesh_acceptors.push((dmesh_rx, registrar));
+            }
+        }
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
         let shutdown_grace_period = config.shutdown_grace_period;
@@ -188,6 +197,37 @@ fn main() {
         #[cfg(feature = "doca")]
         for (dmesh_rx, registrar) in dmesh_acceptors {
             app.spawn_dmesh(dmesh_rx, registrar);
+        }
+
+        // Sharded mode: one pinned thread + current_thread runtime per worker.
+        // Worker i pins to core 15-i (the harness tasksets the process to the
+        // top-N cores, so shards land inside that mask).
+        #[cfg(feature = "doca")]
+        for (i, driver, dmesh_rx, registrar) in dmesh_shards {
+            let serve = app.dmesh_serve_future(dmesh_rx, registrar);
+            let core = 15usize.saturating_sub(i);
+            std::thread::Builder::new()
+                .name(format!("dmesh-shard-{i}"))
+                .spawn(move || {
+                    if !dmesh_doca::pin_current_thread_to_core(core) {
+                        warn!(worker = i, core, "dmesh shard: failed to pin core");
+                    }
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("dmesh shard runtime");
+                    rt.block_on(async move {
+                        info!(worker = i, core, "dmesh shard running (pinned current_thread runtime)");
+                        tokio::spawn(async move {
+                            match driver.run().await {
+                                Ok(()) => warn!(worker = i, "dmesh driver exited"),
+                                Err(error) => warn!(worker = i, %error, "dmesh driver failed"),
+                            }
+                        });
+                        serve.await;
+                    });
+                })
+                .expect("spawn dmesh shard thread");
         }
 
         info!("Admin interface on {}", app.admin_addr());

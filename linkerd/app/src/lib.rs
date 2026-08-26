@@ -402,13 +402,23 @@ impl App {
         events: mpsc::UnboundedReceiver<dmesh_doca::DmeshEvent>,
         registrar: dmesh_doca::Registrar,
     ) {
+        tokio::spawn(self.dmesh_serve_future(events, registrar));
+    }
+
+    /// The dmesh acceptor as a bare future, so a sharded deployment can run it
+    /// (plus its driver) on a dedicated per-worker current_thread runtime
+    /// instead of the shared multi-thread runtime (DMESH_SHARDED=1).
+    #[cfg(feature = "doca")]
+    pub fn dmesh_serve_future(
+        &self,
+        events: mpsc::UnboundedReceiver<dmesh_doca::DmeshEvent>,
+        registrar: dmesh_doca::Registrar,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let outbound = self.dmesh_outbound.clone();
         let get_policy = self.dmesh_policies.clone();
         let shutdown = self.dmesh_drain.clone().signaled();
-        tokio::spawn(
-            dmesh::serve(events, registrar, outbound, get_policy, shutdown)
-                .instrument(info_span!("dmesh").or_current()),
-        );
+        dmesh::serve(events, registrar, outbound, get_policy, shutdown)
+            .instrument(info_span!("dmesh").or_current())
     }
 
     pub fn inbound_addr(&self) -> Local<ServerAddr> {

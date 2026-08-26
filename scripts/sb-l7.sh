@@ -23,10 +23,12 @@ setsid ./target/release/mock-policy      > $LOG/mock-policy.log 2>&1 </dev/null 
 for p in 8087 8088 8089; do for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && break; sleep 0.2; done; done
 
 step "1. proxy (W=$W workers, $CORES cores, pinned to $((16-CORES))-15)"
-DMESH_NUM_WORKERS=$W LINKERD2_PROXY_CORES=$CORES \
+SHENV=""; RT_CORES=$CORES
+if [ -n "${DMESH_SHARDED:-}" ]; then SHENV="DMESH_SHARDED=1"; RT_CORES=1; step "   (sharded: W=$W pinned current_thread runtimes, main rt 1 thread)"; fi
+DMESH_NUM_WORKERS=$W LINKERD2_PROXY_CORES=$RT_CORES \
     LINKERD2_PROXY_ADMIN_LISTEN_ADDR=127.0.0.1:4991 \
     LINKERD2_PROXY_INBOUND_LISTEN_ADDR=127.0.0.1:5143 \
-    setsid taskset -c $((16-CORES))-15 ./target/release/linkerd2-proxy > $LOG/dproxy.log 2>&1 </dev/null &
+    setsid env $SHENV taskset -c $((16-CORES))-15 ./target/release/linkerd2-proxy > $LOG/dproxy.log 2>&1 </dev/null &
 for i in $(seq 1 25); do [ "$(grep -ac "Started DOCA comch server" $LOG/dproxy.log 2>/dev/null)" -ge "$W" ] && break; sleep 1; done
 S=$(grep -ac "Started DOCA comch server" $LOG/dproxy.log); [ "$S" -ge "$W" ] || die "proxy servers $S/$W"
 step "   $S comch servers up"

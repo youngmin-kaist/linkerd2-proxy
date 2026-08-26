@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cc",
+ "libc",
  "linkerd-io",
  "pkg-config",
  "tokio",

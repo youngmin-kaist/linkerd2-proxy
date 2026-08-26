@@ -120,3 +120,22 @@ fetch-add 폭풍) + `Mutex::lock_contended`. 유휴 스핀은 아님(유휴 CPU 
 결론: 공유 캐시라인(Arc refcount·공유 메트릭·런타임 상태) 경합 + tokio work-stealing의
 지역성 파괴. 개선안: worker별 독립 current_thread 런타임+피닝, 요청당 Arc 클론 제거,
 메트릭 샤딩. (8×싱글코어 프로세스 A/B는 comch 멀티프로세스 연결 hang으로 보류.)
+
+## Sharded per-worker runtimes (DMESH_SHARDED=1, 2026-08-26)
+
+워커별 전용 OS 스레드(코어 피닝) + current_thread 런타임에서 driver+acceptor+플로우 전부
+실행 (work-stealing 제거, dpu_worker.c의 Rust 미러). 모든 수치 h2 종단 metrics 검증:
+
+| cores | shared runtime | sharded | sharded per-core | 개선 |
+|---|---|---|---|---|
+| 1 | 17.4k | 18.4k | 18.4k | +6% |
+| 2 | 22.2k | 35.1k | 17.6k | +58% |
+| 4 | 39.1k | 66.7k | 16.7k | +71% |
+| 8 | 69.2k | **121.2k** | 15.2k | +75% |
+| 16 | 100.0k | **150.0k** | 9.4k | +50% |
+
+- 스케일링 5.7×→8.2×(16코어); 8코어 효율 50%→87% — IPC-붕괴 진단이 정확했음을 확인.
+- C16은 DPU busy 12.2/16으로 미포화: 호스트에 h2load 16 + busy-poll 브리지 16(>18코어)로
+  클라이언트 쪽이 한계 → 150k는 하한값. 브리지 busy-poll 백오프가 다음 과제.
+- 사용법: DMESH_SHARDED=1 + DMESH_NUM_WORKERS=W(=코어수), LINKERD2_PROXY_CORES=1(메인 rt).
+  worker i는 코어 15-i에 피닝.

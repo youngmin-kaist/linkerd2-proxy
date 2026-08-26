@@ -280,3 +280,14 @@ unsafe fn c_ptr_to_string(ptr: *const c_char) -> String {
 
     CStr::from_ptr(ptr).to_string_lossy().into_owned()
 }
+
+/// Pin the calling OS thread to a single CPU core (sharded worker runtimes).
+/// Returns false if the affinity call failed.
+pub fn pin_current_thread_to_core(core: usize) -> bool {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
