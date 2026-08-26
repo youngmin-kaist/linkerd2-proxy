@@ -155,3 +155,13 @@ DMESH_SPLICE_SPIN=1로 순수 스핀 복귀) — M=16에서 호스트 32 hot 프
 
 16코어 스케일링 10.9×. 사이드카 Setup A(호스트 x86 18코어) 304k와 비교: DPU 16 Arm 코어로
 그 61% 처리량을 호스트 코어 소모 없이 제공(호스트는 h2load 부하기 제외 유휴).
+
+### MemoOneshotRoute — 요청당 라우트 스택 클론 제거 (2026-08-26)
+
+linkerd_router에 `NewMemoOneshotRoute` 추가, outbound HTTP policy 라우터에 적용: 동일
+key 연속 요청은 메모된 라우트 서비스를 직접 호출(클론 0회), key 전환·미준비 시 기존
+clone+Oneshot 폴백(시맨틱 보존; 정책 변경은 key 변화/라우터 재생성으로 캐시 미스).
+결과: perf에서 box_clone_sync→LoadShed→Vec 클론 체인 소멸 확인. 그러나 처리량은
+C1 17.4k / C8 120.5k / C16(재측정 필요)로 오차 내 동일 — 그 체인은 사이클의 ~2%였고,
+남은 atomics(~17%)는 메트릭 카운터·waker 등 다른 출처. 코드가 엄밀히 덜 일하므로 유지.
+다음 후보: C16에서 전 코어에 걸쳐 바운싱하는 공유 메트릭 캐시라인 샤딩.

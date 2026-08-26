@@ -122,7 +122,7 @@ where
                 // Lazily cache a service for each `RouteParams` returned from the
                 // `SelectRoute` impl.
                 .push_on_service(route::MatchedRoute::layer(metrics.clone()))
-                .push(svc::NewOneshotRoute::<Self, (), _>::layer_cached())
+                .push(svc::router::NewMemoOneshotRoute::<http::Request<http::BoxBody>, Self, (), _>::layer_cached())
                 .arc_new_clone_http()
                 .into_inner()
         })
