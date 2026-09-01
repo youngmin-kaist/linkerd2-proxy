@@ -260,3 +260,27 @@ EnforcementPolicy 기본 MinTime(5분) → `GOAWAY too_many_pings` → TCP는 �
 - **DPUMesh N=1: 7,257–8,059 req/s (3회 연속, 평균 ~7.6k) — 동등(오차 내)**
 - 피크는 캐시 웜 상태라 rate 수정의 처리량 영향은 작고, 효과는 정확성·캐시 오염 제거·
   콜드 스타트 안정성·저부하 tail(p99 89ms@R5k)에 나타남.
+
+### TCP-direct 피크 병목 분해 + 분모 정정 (2026-09-02)
+
+**정정**: rapids4는 36 물리코어(6554S, SMT off). 앞 절들의 host busy "x/18"은 분모
+오류 — 비율은 옳고 코어 수는 2배로 읽을 것 (예: "13.6/18" → 실제 ≈27/36).
+
+피크(8,038 req/s, c512 R=16000, warmed) 중 10초 창 프로세스별 CPU:
+
+| 소비자 | 코어 | 비고 |
+|---|---|---|
+| **reservation** | **12.8** | 단일 지배 (~46% of app), ≈1.6ms CPU/req |
+| rate | 4.1 | scan 수정 후에도 2위 |
+| frontend | 2.5 | HTTP+팬아웃 |
+| search | 2.2 | |
+| profile / geo / recommendation | 1.5 / 1.0 / 0.6 | |
+| memcached-reserve (컨테이너) | 1.2 | reservation 짝 |
+| mongo 8개 합 | ~0.6 | 웜 캐시라 유휴 |
+| wrk2 | 0.7 | 부하기 오버헤드 미미 |
+| 시스템 | usr 70% / sys 7.6% / **iowait 0** / idle 21% | **busy ≈ 28.4/36** |
+
+**병목 = reservation 서비스의 요청당 CPU 비용**(CheckAvailability 루프). 디스크/DB
+아님(iowait 0, mongo 유휴). idle 7.6코어가 남으므로 전 코어 포화가 아니라 reservation
+단일 인스턴스의 실질 상한 — 더 올리려면 reservation(+memcached-reserve) replica가
+레버 (kind 실험의 "replicated B" 결론과 일치).
