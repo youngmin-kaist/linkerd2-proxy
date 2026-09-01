@@ -194,3 +194,31 @@ P = 클라이언트 연결 수(=백엔드 리스너 수, per-pair dst 샤딩), M
   (host_lib), comp/msgq/consumer 파괴를 thread destroy 전 인라인으로 복원.
 - DMESH_NO_TEARDOWN 스톱갭 추가했으나 아직 발동 안 함(CLOSING 경로 진입 여부 조사 필요).
   벤치는 런당 새 프록시라 영향 없음.
+
+## DSB hotelReservation L3 통합 — gRPC-over-DMA e2e (2026-09-02)
+
+hotelRes의 모든 서비스 간 gRPC 홉(9 서비스)을 dmeshgo 트랜스포트로 교체
+(dialer WithContextDialer + 서비스 리스너 dmesh.Listen; consul 우회, 정적 dst 키
+10.0.2.x). 서비스는 호스트 bare 프로세스, 인프라(mongo/memcached/consul/jaeger)는
+compose 컨테이너(브리지 IP 직결), 프록시 W=8 sharded. 패치: dmeshgo/dsb-integration.patch,
+하네스: scripts/dsb-dmesh.sh + dmeshgo/dsb_*.{sh,py}.
+
+wrk2 mixed-workload, t8 c128 d20 (전 측정 preflight 200 확인, request_total 1.44M로
+프록시 L7 통과 검증):
+
+| R | TCP-direct (baseline) | DPUMesh | 
+|---|---|---|
+| 2000 | p50 2.7ms / p99 15ms | p50 9.2ms / p99 27ms |
+| 5000 | p50 5.8ms / p99 40ms | p50 18.5ms / p99 88ms |
+| 8000 | 7.6k (붕괴 시작) | 5.9k (붕괴) |
+| 12000 (포화) | **7.8k** | **6.0k** (−23%) |
+| host busy @포화 | 12.8/18 | **12.0/18** |
+| DPU busy | — | 4-5/16 |
+
+- 포화 −23%는 홉당 DMA 왕복 지연(에코 warm 2.1ms와 정합; frontend→search→geo/rate
+  2단 체인)이 closed-loop 처리량에 반영된 것. DPU는 4-5코어로 여유 — 병목은 여전히
+  호스트 앱/DB.
+- **호스트 코어가 baseline보다 오히려 낮음(12.0 vs 12.8)**: 메시 L7 비용이 DPU로
+  이동. 사이드카(kind: SLO −36%, 사이드카 CPU +33% host)와 대조되는 핵심 결과.
+- 공정성 주의: baseline은 메시 기능 없음; DPUMesh는 L7 라우팅+authz 통과(mTLS는
+  PCIe 설계상 없음). kind 사이드카 수치는 다른 환경(참고용).
