@@ -165,3 +165,32 @@ clone+Oneshot 폴백(시맨틱 보존; 정책 변경은 key 변화/라우터 재
 C1 17.4k / C8 120.5k / C16(재측정 필요)로 오차 내 동일 — 그 체인은 사이클의 ~2%였고,
 남은 atomics(~17%)는 메트릭 카운터·waker 등 다른 출처. 코드가 엄밀히 덜 일하므로 유지.
 다음 후보: C16에서 전 코어에 걸쳐 바운싱하는 공유 메트릭 캐시라인 샤딩.
+
+## gRPC 64B 에코 스루풋 — dmeshgo 트랜스포트 (2026-09-01, scripts/dm-bench.sh)
+
+Go gRPC(unary Ping, 64B req/64B resp, raw codec) ↔ DMA 채널 ↔ DPU 프록시 L7.
+P = 클라이언트 연결 수(=백엔드 리스너 수, per-pair dst 샤딩), M=64 in-flight/conn.
+전 측정 preflight(연결당 에코 1회 내용검증) + mid-run request_total로 h2 종단 확인.
+
+| 코어(W) | best P | req/s | DPU busy | per-core |
+|---|---|---|---|---|
+| 1 | 2 | 13.1k | 1.3 | 13.1k |
+| 2 | 4 | 27.3k | 2.4 | 13.7k |
+| 4 | 8 | 53.2k | 4.4 | 13.3k |
+| 8 | 16 | 95.8k | 8.2 | 12.0k |
+| 16 | 32 | **151.5k** | **14.5/16** | 9.5k |
+
+- 16코어에서 DPU 포화(M=128로 올려도 145k — 서버측 병목 확인). h2load 1KB 187k 대비
+  gRPC unary 오버헤드(per-RPC 프레이밍/trailer) 반영된 수치.
+- P 상한 = DPA 슬롯 예산: 페어당 채널 3개(ingress+backend+spare) × 슬롯 8/워커 → P ≤ ~2.6W.
+  P>2W는 preflight에서 슬롯 고갈로 실패(정상 동작).
+
+### 재연결(teardown 후 재접속) 조사 상태
+- 근본 원인 좁힘: 프록시 프로세스에서만 DPA thread destroy가 flexio에서 실패
+  ("Failed to destroy thread") → comch 함수 전체 wedge → 이후 모든 client 등록이
+  devx syndrome 0xe5300으로 abort. C 워커(단독 conn)는 동일 코드로 재연결 성공,
+  형제 conn이 있으면 C 워커도 재연결 시 crash.
+- 적용된 수정(유지): 서버측 doca_comch_server_disconnect, 클라이언트 graceful close
+  (host_lib), comp/msgq/consumer 파괴를 thread destroy 전 인라인으로 복원.
+- DMESH_NO_TEARDOWN 스톱갭 추가했으나 아직 발동 안 함(CLOSING 경로 진입 여부 조사 필요).
+  벤치는 런당 새 프록시라 영향 없음.
