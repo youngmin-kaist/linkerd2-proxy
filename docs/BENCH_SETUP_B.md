@@ -241,3 +241,22 @@ wrk2 mixed-workload, t8 c128 d20 (전 측정 preflight 200 확인, request_total
   처리량 이득 없음(병목이 채널이 아님). N≥2는 장시간 러닝에서 붕괴 관측 —
   채널 하나가 죽으면 재연결 wedge(미해결)로 해당 엣지가 소실되는 실전 영향.
   당분간 N=1 권장.
+
+### rate DB-scan 버그 수정 + keepalive 안정화 재측정 (2026-09-02)
+
+**rate 수정**: GetRates의 캐시 미스 경로가 upstream 그대로 3중 결함이었음 —
+빈 필터 `Find(bson.D{})`(미스마다 풀 컬렉션 스캔) + 전체 rate plan을 응답에 추가
+(정확성 오염) + 그 전체를 해당 id 캐시값으로 저장(캐시 오염; 기존 "gets/req 1000"의
+근원). `bson.M{"hotelId": id}` 필터로 수정 + mongo `hotelId` 인덱스 생성.
+(다른 서비스의 `Find(bson.D{})`는 시작 시 1회 로드라 정상.)
+
+**연속 러닝 붕괴의 진범 = gRPC keepalive**: 클라이언트 ping 주기 < 서버
+EnforcementPolicy 기본 MinTime(5분) → `GOAWAY too_many_pings` → TCP는 재연결로
+자가치유, dmesh는 재연결 wedge로 엣지 소실. 9개 서비스 서버 옵션에
+`MinTime: 10s` 추가로 근본 차단 (수정 후 too_many_pings 0, 같은 스택 3연속 피크 안정).
+
+최종 피크(웜업 표준화, c512 R=16000, rate+keepalive 수정 후):
+- TCP-direct: 7,693–7,922 req/s (3회)
+- **DPUMesh N=1: 7,257–8,059 req/s (3회 연속, 평균 ~7.6k) — 동등(오차 내)**
+- 피크는 캐시 웜 상태라 rate 수정의 처리량 영향은 작고, 효과는 정확성·캐시 오염 제거·
+  콜드 스타트 안정성·저부하 tail(p99 89ms@R5k)에 나타남.
