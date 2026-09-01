@@ -284,3 +284,22 @@ EnforcementPolicy 기본 MinTime(5분) → `GOAWAY too_many_pings` → TCP는 �
 아님(iowait 0, mongo 유휴). idle 7.6코어가 남으므로 전 코어 포화가 아니라 reservation
 단일 인스턴스의 실질 상한 — 더 올리려면 reservation(+memcached-reserve) replica가
 레버 (kind 실험의 "replicated B" 결론과 일치).
+
+### reservation replica×4 (2026-09-02)
+
+병목(reservation 단일 인스턴스)을 4 replica로 확장. TCP는 포트 분리(+10000·r)+
+frontend round_robin, DMA는 replica 키 4개(10.0.17.1-4) 프로세스별 리스너.
+
+| 구성 (warmed, c512) | peak req/s | host busy |
+|---|---|---|
+| TCP-direct, res×1 | 7.7–7.9k | ~28/36 |
+| **TCP-direct, res×4** | **11.3–11.8k (peak 12.1k@R24k)** | **~31.6/36 (88%)** |
+
+- **reservation이 정확한 레버였음**: +55% (병목 분해가 옳았음). res×4에서 host가
+  진짜 포화(88%)에 근접 — 다음 병목은 전 코어.
+- DMA(DPUMesh) res×4: 4채널 모두 프록시에 등록되나 트래픽 전달 0 → 붕괴.
+  원인은 frontend의 단일 grpc.ClientConn + round_robin(4 subconn) 조합이 dmesh
+  ContextDialer와 물릴 때 subconn이 READY로 전이해도 전달 안 됨(통합 버그, 전송
+  자체와 무관). 부수로 발견·수정한 실버그: Listener 스페어 폴링이 gRPC가 닫은
+  채널을 claimed() 폴링 → cgo UAF SIGSEGV. host_lib+dmeshgo에 dead-guard 추가로
+  크래시는 제거. 멀티-replica 전달은 미해결(follow-up); N=1은 정상.
