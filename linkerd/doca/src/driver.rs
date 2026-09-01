@@ -80,6 +80,12 @@ extern "C" {
     // Report the connection's mapped tx_staging region (usable base + len) so
     // the writer stages response bytes in place. Negative doca_error_t until
     // the reverse path is ready.
+    // Free buffers parked by conn teardown; call only after the dead slots'
+    // IO handles were marked via clear_tx_staging/clear_rx_staging.
+    fn dmesh_doca_reap_graves(objs: *mut c_void);
+
+    fn dmesh_doca_data_drain_only(objs: *mut c_void, budget: c_int, out_drained: *mut c_int) -> c_int;
+
     fn dmesh_doca_conn_tx_staging(
         objs: *mut c_void,
         slot: i32,
@@ -204,6 +210,11 @@ pub struct Driver {
     reg_rx: mpsc::UnboundedReceiver<Registration>,
     conn_states: [ConnState; MAX_CONNS],
     handles: [Option<crate::DmeshIoHandle>; MAX_CONNS],
+    // Set once any connection on this worker has been torn down: from then on
+    // the consumer PE is driven by the 1ms tick (drain-only), never by
+    // arm/clear_notification - teardown corrupts that path inside libdoca.
+    saw_teardown: bool,
+
     // Whether a slot's tx_staging region has been reported to its handle yet.
     // The reverse path becomes ready a tick or two after registration, so this
     // is retried until `dmesh_doca_conn_tx_staging` succeeds.
@@ -241,6 +252,7 @@ impl Driver {
             reg_rx,
             conn_states: [ConnState::Free; MAX_CONNS],
             handles: [NONE; MAX_CONNS],
+            saw_teardown: false,
             tx_set: [false; MAX_CONNS],
             t_in: None,
             dpu_sum_us: 0,
@@ -464,9 +476,10 @@ impl Driver {
             if matches!(cur, ConnState::Free | ConnState::Error) {
                 if let Some(handle) = self.handles[slot].take() {
                     handle.clear_tx_staging();
-                    handle.close_rx();
+                    handle.clear_rx_staging();
                 }
                 self.tx_set[slot] = false;
+                self.saw_teardown = true;
             }
 
             if let Some(ev) = ev {
@@ -525,22 +538,37 @@ impl Driver {
             // syscall/doorbell cost) is skipped entirely.
             if !busy_poll {
                 check(unsafe { dmesh_doca_ctrl_arm(self.doca.raw()) })?;
-                check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
+                // After the first teardown the data PE's notification state is
+                // poisoned inside libdoca (clear_notification hits a NULL
+                // internal pointer); stop arming it - the 1ms safety-net tick
+                // below keeps the datapath live via drain-only polling.
+                if !self.saw_teardown {
+                    check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
+                }
             }
 
             check(unsafe { dmesh_doca_ctrl_drain(self.doca.raw()) })?;
             let mut drained: c_int = 0;
-            check(unsafe {
-                dmesh_doca_data_clear_and_drain(
-                    self.doca.raw(),
-                    data_fd,
-                    DATA_DRAIN_BUDGET,
-                    &mut drained,
-                )
-            })?;
+            if self.saw_teardown {
+                check(unsafe {
+                    dmesh_doca_data_drain_only(self.doca.raw(), DATA_DRAIN_BUDGET, &mut drained)
+                })?;
+            } else {
+                check(unsafe {
+                    dmesh_doca_data_clear_and_drain(
+                        self.doca.raw(),
+                        data_fd,
+                        DATA_DRAIN_BUDGET,
+                        &mut drained,
+                    )
+                })?;
+            }
 
             self.advance()?;
             self.emit_conn_events();
+            // Teardown parked freed-racy buffers in graves; the handles of all
+            // dead slots are marked now, so the regions are unreachable.
+            unsafe { dmesh_doca_reap_graves(self.doca.raw()) };
             // Install any handles the acceptor registered, then deliver the
             // recv segments the drain above produced to the reading stacks.
             self.drain_registrations();

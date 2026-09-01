@@ -438,6 +438,19 @@ impl DmeshIoHandle {
         inner.wake_reader();
     }
 
+    /// The connection is being torn down: the forward staging region is about
+    /// to be freed. Drop undelivered zero-copy segments (the peer is gone) and
+    /// return EOF to the reader; no further copies from `staging_base` happen
+    /// once this returns.
+    pub fn clear_rx_staging(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.staging_base = 0;
+        inner.segs.clear();
+        inner.seg_read_off = 0;
+        inner.rx_closed = true;
+        inner.wake_reader();
+    }
+
     /// Signal peer half-close: pending data drains, then reads return EOF.
     pub fn close_rx(&self) {
         let mut inner = self.inner.lock().unwrap();
