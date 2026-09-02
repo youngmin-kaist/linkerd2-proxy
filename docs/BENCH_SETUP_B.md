@@ -303,3 +303,19 @@ frontend round_robin, DMA는 replica 키 4개(10.0.17.1-4) 프로세스별 리�
   자체와 무관). 부수로 발견·수정한 실버그: Listener 스페어 폴링이 gRPC가 닫은
   채널을 claimed() 폴링 → cgo UAF SIGSEGV. host_lib+dmeshgo에 dead-guard 추가로
   크래시는 제거. 멀티-replica 전달은 미해결(follow-up); N=1은 정상.
+
+### 멀티-replica 다이얼 수정 (2026-09-02)
+
+결함 2(전달 0) 근본원인 확정 + 수정: **단일 ClientConn + round_robin(N subconn)**이
+dmesh 백엔드-채널 스페어-리스너 모델과 맞물려 subconn이 전달 상태로 못 감. 결함 1(워커
+aliasing)은 슬롯 고갈 미발생으로 이번 실패와 무관.
+
+수정(dmesh/balanced.go): replica당 **독립 grpc.ClientConn(단일 채널 passthrough)** N개 +
+원자적 RR picker(`balancedConn` implements ClientConnInterface). frontend
+initReservation만 교체. **검증: reservation POST preflight 200(이전 무한 hang) +
+초기 부하에서 replica들 전달** → 다이얼 로직은 정상 동작.
+
+**그러나 지속 부하에서 붕괴(143→0)**: reservation 채널들이 부하 중 teardown되며
+flexio thread-destroy 실패(wedge)로 엣지 소실. 이는 다이얼이 아니라 **기존 미해결
+teardown/재연결 wedge**가 다채널 churn에서 더 쉽게 드러난 것 (DMESH_NO_TEARDOWN도 이
+경로 미차단). → 멀티-replica 피크 측정은 teardown 근본수정이 선결과제. N=1은 안정.
