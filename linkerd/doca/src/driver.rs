@@ -69,6 +69,7 @@ extern "C" {
     ) -> c_int;
     // Used once staging-buffer flow control lands (read watermark -> DPA).
     #[allow(dead_code)]
+    fn dmesh_doca_conn_rx_watermark(objs: *mut c_void, slot: i32, pos: u32) -> i32;
     fn dmesh_doca_conn_recv_release(
         objs: *mut c_void,
         slot: i32,
@@ -574,6 +575,15 @@ impl Driver {
             self.drain_registrations();
             self.pump_recv();
             self.pump_send();
+            // Staging flow control: tell each slot's DPA thread how far the
+            // reader got, so it can reuse the staging ring behind it.
+            for slot in 0..MAX_CONNS {
+                if let Some(h) = self.handles[slot].as_ref() {
+                    if let Some(p) = h.take_rx_watermark() {
+                        unsafe { dmesh_doca_conn_rx_watermark(self.doca.raw(), slot as i32, p) };
+                    }
+                }
+            }
             self.maybe_report_stats(&mut stats_last, &mut stats_prev);
 
             // Budget exhausted: more data-path work is pending, don't sleep

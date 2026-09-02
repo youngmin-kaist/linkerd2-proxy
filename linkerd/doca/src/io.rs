@@ -161,6 +161,10 @@ struct Inner {
     staging_base: usize,
     staging_len: usize,
     segs: VecDeque<(u32, u32)>,
+    /// Staging offset up to which every segment has been consumed (published
+    /// to the DPA as its reuse gate), and whether it moved since last publish.
+    rx_watermark: u32,
+    rx_watermark_dirty: bool,
     seg_read_off: usize, // partial-consume cursor into segs.front()
 
     /// Peer half closed: reads drain rx/segs then return EOF.
@@ -286,6 +290,9 @@ impl AsyncRead for DmeshIo {
             if inner.seg_read_off >= seg_len {
                 inner.segs.pop_front();
                 inner.seg_read_off = 0;
+                // Segment fully consumed: the DPA may reuse staging up to here.
+                inner.rx_watermark = pos + len;
+                inner.rx_watermark_dirty = true;
                 if seg_cache::evict_on() {
                     // SAFETY: same completed-segment invariant as the copy above.
                     seg_cache::evict(unsafe { base.add(pos as usize) }, seg_len);
@@ -416,6 +423,17 @@ impl DmeshIoHandle {
 
     /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
     /// to the reading stack (zero-copy: no bytes are moved here).
+    /// Take the consumed-staging watermark if it moved since the last take.
+    pub fn take_rx_watermark(&self) -> Option<u32> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.rx_watermark_dirty {
+            inner.rx_watermark_dirty = false;
+            Some(inner.rx_watermark)
+        } else {
+            None
+        }
+    }
+
     pub fn push_segment(&self, pos: u32, len: u32) {
         let mut inner = self.inner.lock().unwrap();
         if inner.staging_base != 0 {

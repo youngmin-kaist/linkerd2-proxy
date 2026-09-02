@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -395,6 +396,24 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 	return DOCA_SUCCESS;
 }
 
+/* Publish the reader's staging watermark to this slot's DPA thread
+ * (dpa_thread_arg.rd_pos) so the kernel's staging gate can advance. Called
+ * from the driver tick only when the watermark moved; one small h2d_memcpy. */
+int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_t pos)
+{
+	struct dmesh_conn *conn;
+	struct dmesh_doca_dpa_thread *t;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return DOCA_ERROR_INVALID_VALUE;
+	conn = &objs->conns[slot];
+	t = conn->dpa_thread;
+	if (t == NULL || t->thread == NULL || t->arg == 0)
+		return DOCA_ERROR_BAD_STATE;
+	return doca_dpa_h2d_memcpy(t->dpa, t->arg + offsetof(struct dpa_thread_arg, rd_pos),
+				   &pos, sizeof(pos));
+}
+
 /* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
  * DPA runs) fires a completion only when the copy is a multiple of 128B, or a
  * single sub-block <=128B. Emit the largest 128-aligned copy (<=8064 = 63*128,
@@ -518,6 +537,8 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 						  const char *server_name,
 						  struct objects **handle)
 {
+	dmesh_staging_fc = 1; /* we publish rd_pos (dmesh_doca_conn_rx_watermark) */
+
 	struct doca_log_backend *sdk_log;
 	struct objects *objs;
 	doca_error_t result;

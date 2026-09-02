@@ -402,3 +402,27 @@ MAGIC 없으면 레거시 동작(구 host 호환). 발행 보류 시 tx_staging�
 빌드 함정 기록: shim.c의 grave 잔재(제거된 object.h 필드 참조)로 **프록시 재빌드가
 조용히 실패**해 FC 없는 06:53 바이너리로 두 라운드를 헛측정함 — cargo 빌드는 성공
 로그를 반드시 확인할 것.
+
+### c768 cliff 해결: 세 번째 방향(DPA→DPU staging) backpressure (2026-09-02)
+
+**진단 사슬**: c768 붕괴는 비회복(hang) → push gate 진단 로그 0건(push FC는 무관) →
+드라이버 tick 재시도·take_staged 멱등성 확인(lost-wakeup 아님) → 프록시 로그에
+`Unexpected error … endpoint 10.0.12.1: operation was canceled`(29s) 후 `dmesh connection
+setup failed` 연발 = storm이 h2 연결을 깨뜨리고 재다이얼이 wedge에 걸림 → 원인은
+shim.c의 마지막 `TODO(flow-control)`: **DPA가 DPU staging 링에 쓸 때 Rust 소비를 확인하지
+않고 wrap** → 미소비 h2 프레임 덮어쓰기.
+
+**수정(옵트인, 프록시만 활성)**: `dpa_thread_arg.rd_pos/rd_fc` 추가. io.rs가 세그먼트를
+완전 소비할 때 워터마크 갱신 → 드라이버 tick에서 변경분만 `h2d_memcpy`로 DPA에 발행
+(`dmesh_doca_conn_rx_watermark`) → 커널은 여유 < 3×8064면 desc 소비 중단(→ consumer_head
+정지 → host forward gate → h2 backpressure 체인 완성). C 워커/벤치(rd_fc=0)는 기존 동작.
+부수: 에러 콜백의 PULL_CURSOR 처리 + stale-pull 자가복구 + gate 진단(4096회마다 WARN).
+
+| 부하 (res×4, warmed) | 이전 | **3-방향 FC** |
+|---|---|---|
+| c512 R16000 | 10.1–10.3k | 9.8–9.9k |
+| **c768 R24000** | **236 → hang** | **10,904 / 10,886 (연속)** |
+| 이후 c512 (회복) | 15 | **9,946 / 9,940** |
+
+Unexpected error 0, push gate held 0. **멀티-replica 피크 ≈ 10.9k req/s** (TCP res×4 12.1k의
+90%). 잔여: 부하 종료 후 유휴 전환 시 `setup failed`(재다이얼→wedge, 측정 무영향).
