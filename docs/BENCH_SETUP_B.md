@@ -319,3 +319,19 @@ initReservation만 교체. **검증: reservation POST preflight 200(이전 무�
 flexio thread-destroy 실패(wedge)로 엣지 소실. 이는 다이얼이 아니라 **기존 미해결
 teardown/재연결 wedge**가 다채널 churn에서 더 쉽게 드러난 것 (DMESH_NO_TEARDOWN도 이
 경로 미차단). → 멀티-replica 피크 측정은 teardown 근본수정이 선결과제. N=1은 안정.
+
+### teardown/flexio 근본수정 조사 (2026-09-02)
+
+**진짜 성과 = 워커-aliasing 회귀 수정.** 멀티-replica 패치에서 채널→워커 매핑을
+`(idx*4+r)%W`로 바꾼 것이 단일 서비스들을 워커 0·4에 5개씩 몰아(1·2·3 공백) DPA 슬롯
+(8/워커)을 고갈시켜 **N=1 DSB를 7k→38 req/s로 회귀**시켰음. `(idx+r)%W`로 수정 →
+N=1 7,022 복구. 이 슬롯-고갈 churn이 DSB에서 관측된 flexio wedge의 주 유발원이었음
+(매핑 수정 후 정상 운영 flexio 에러 0).
+
+**thread_stop 소견(opt-in 유지)**: 격리된 C-워커 sibling-teardown 재현자에서
+`doca_dpa_thread_stop`을 destroy 전에 넣으면 flexio "Failed to destroy thread" 2→0.
+그러나 프록시 INGRESS_PUSH 경로에선 오히려 회귀 → 기본 OFF(`DMESH_THREAD_STOP`
+opt-in). 프록시 클라이언트-채널 teardown이 C-워커 backend 경로와 다른 점은 미규명.
+
+**남은 별개 이슈**: res×4 balancedConn 멀티채널 처리량(654→17 붕괴, flexio 0·프로세스
+생존) — teardown 아님, 멀티-replica 다이얼 성능 문제로 별도 트랙. N=1은 안정(7k).
