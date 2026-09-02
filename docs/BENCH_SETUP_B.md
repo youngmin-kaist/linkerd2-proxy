@@ -335,3 +335,20 @@ opt-in). 프록시 클라이언트-채널 teardown이 C-워커 backend 경로와
 
 **남은 별개 이슈**: res×4 balancedConn 멀티채널 처리량(654→17 붕괴, flexio 0·프로세스
 생존) — teardown 아님, 멀티-replica 다이얼 성능 문제로 별도 트랙. N=1은 안정(7k).
+
+### 멀티-replica 3번째 결함 조사 (2026-09-02, 미해결)
+
+두 하위버그 수정: ① `ServiceFromTarget`이 벌거벗은 서비스명(review/attractions는
+consul URL 아닌 raw name으로 다이얼)을 못 잡아 TCP 폴백("missing port") → raw name도
+인식하도록 수정(회귀 없음, 보존). ② 워커 매핑 (idx+r)%W (앞 절).
+
+**근본 결함은 미해결**: res×4 지속 부하에서 첫 런만 부분 처리(654→1445) 후 붕괴,
+모든 reservation replica가 **CONNECTION_ABORTED**. 원인 = dmesh 채널의 1회용 수명 vs
+gRPC 재연결: 부하 중 h2 연결이 한 번 끊기면 subchannel이 재다이얼 → 프록시가 이미
+teardown한 슬롯이라 abort → TRANSIENT_FAILURE 고착. 채널 keepalive/idle 억제 우회는
+역효과(부하 0). **즉 멀티-replica 피크는 dmesh 채널의 재연결/영속성(=teardown 트랙의
+근본 뿌리) 없이는 불가.** 통합 계층(balancedConn, ServiceFromTarget, 워커매핑)은 모두
+정상화됐고 단일요청은 200; 남은 것은 C 데이터패스의 채널 재연결 지원 하나.
+
+현 상태 확정 수치: DPUMesh **N=1 = 7,022 req/s(안정)**, res×4는 재연결 뿌리문제로 측정불가.
+TCP-direct res×4 = 12.1k(참고).
