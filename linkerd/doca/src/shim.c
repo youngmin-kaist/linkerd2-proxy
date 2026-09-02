@@ -251,48 +251,12 @@ int32_t dmesh_doca_data_drain_only(struct objects *objs, int budget, int *out_dr
  */
 
 
-/* Free buffers parked by dmesh_conn_teardown. Only safe once the dead slots'
- * IO handles have been marked (clear_tx_staging / clear_rx_staging): their
- * mutex guarantees no poll_read/poll_write still touches these regions. */
+/* Teardown grave reaping is retired: conn teardown destroys everything
+ * inline again (see comch_server.c). Kept as a no-op so the driver's call
+ * site stays source-compatible. */
 void dmesh_doca_reap_graves(struct objects *objs)
 {
-	int i, kept = 0;
-
-	if (objs == NULL)
-		return;
-	for (i = 0; i < objs->grave_cnt; i++) {
-		if (objs->graves[i].cool > 0) {
-			/* Not cold yet: residual PE events may still reference it
-			 * (one more clear_and_drain pass runs before the next reap). */
-			objs->graves[i].cool--;
-			objs->graves[kept++] = objs->graves[i];
-			continue;
-		}
-		/* DMESH_GRAVE_LEAK: diagnostic - skip (leak) selected destroy
-		 * classes to bisect which one corrupts the PE notification state.
-		 * Values: substrings "all", "cons", "dma", "comch". */
-		const char *leak = getenv("DMESH_GRAVE_LEAK");
-
-		if (leak != NULL &&
-		    (strstr(leak, "all") != NULL ||
-		     (objs->graves[i].consumer != NULL && strstr(leak, "cons") != NULL) ||
-		     (objs->graves[i].dma != NULL && strstr(leak, "dma") != NULL) ||
-		     (objs->graves[i].dpa_comch != NULL && strstr(leak, "comch") != NULL)))
-			continue; /* dropped without destroying */
-		if (objs->graves[i].consumer != NULL)
-			(void)doca_comch_consumer_destroy(objs->graves[i].consumer);
-		else if (objs->graves[i].dma != NULL)
-			(void)doca_dma_destroy(objs->graves[i].dma);
-		else if (objs->graves[i].dpa_comch != NULL)
-			dmesh_doca_dpa_comch_destroy_parked(objs->graves[i].dpa_comch);
-		else if (objs->graves[i].mem != NULL) {
-			clean_local_mem_bufs(objs->graves[i].mem);
-			free(objs->graves[i].mem);
-		} else {
-			destroy_mmap_and_free_buffer(objs->graves[i].mmap, objs->graves[i].buf);
-		}
-	}
-	objs->grave_cnt = kept;
+	(void)objs;
 }
 
 int32_t dmesh_doca_max_conns(void)
@@ -595,10 +559,6 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 	if (objs == NULL)
 		return DOCA_ERROR_NO_MEMORY;
 
-	/* Rust IO handles may touch staging regions from other threads; make
-	 * conn teardown park those buffers in graves for the driver to reap
-	 * after the handles are marked dead (see dmesh_doca_reap_graves). */
-	objs->defer_free = true;
 
 	result = open_doca_device_with_pci(dev_pci_addr, NULL, &objs->dev);
 	if (result != DOCA_SUCCESS)

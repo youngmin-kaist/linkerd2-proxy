@@ -378,3 +378,27 @@ host가 소비 커서를 공유 ctrl에 기록, DPU는 (seq - host_consumed) < 1
 
 **중간 성과**: res×4 = **8,420 req/s @ c256** (N=1 7.0k 대비 +20%, 멀티-replica 스케일링
 실증) — 흐름제어 한계 내에서는 이미 동작.
+
+### 양방향 flow-control 구현 (2026-09-02) — c512 붕괴 해결
+
+**Push(DPU→host)**: host가 소비 커서(`struct dmesh_push_cursor`: magic+seq+bytes)를
+rcvbuf의 예약영역(offset 2048)에 기록; DPU는 배치 사이 read-DMA(TASK_PULL_CURSOR)로
+당겨와 `(push_seq-consumed_seq) < N-2 && 미소비바이트+2*MAX_BATCH ≤ ring`일 때만 발행.
+MAGIC 없으면 레거시 동작(구 host 호환). 발행 보류 시 tx_staging의 Rust room 체크가
+상류 backpressure로 이어짐.
+**Forward(host→DPU)**: DPA가 이미 갱신하는 `dma_ring_ctrl.consumer_head`를 host가
+읽어 outstanding desc ≥120이면 쓰기 보류(각 ≤8064B라 sndbuf 1MB wrap 불가).
+
+결과 (res×4, 이전 즉사 조건):
+| 부하 | FC 이전 | FC 이후 |
+|---|---|---|
+| c256 R12000 | 8.4k | 7.8k |
+| **c512 R16000** | **17 (hang)** | **10,051 / 10,293 (연속 2회)** |
+| c768 R24000 | 0 | 800 후 붕괴(비회복) — 잔여 한계 |
+
+**res×4 신기록 10.3k** (N=1 7.0k 대비 +47%, TCP res×4 12.1k의 85%). c768 한계는
+후속(용의: pull 주기 vs burst, 브리지 splice drop 경로, DPU측 rcv 링).
+
+빌드 함정 기록: shim.c의 grave 잔재(제거된 object.h 필드 참조)로 **프록시 재빌드가
+조용히 실패**해 FC 없는 06:53 바이너리로 두 라운드를 헛측정함 — cargo 빌드는 성공
+로그를 반드시 확인할 것.
