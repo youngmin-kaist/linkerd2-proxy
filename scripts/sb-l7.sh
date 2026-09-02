@@ -1,5 +1,6 @@
 #!/bin/bash
 # True-L7 (h2-terminated) core sweep. usage: sb-l7.sh <CORES> <W> <M> [curl|load]
+# H2PATH=/ok selects nginx `location /ok { return 200 "ok\n"; }` (3B body) for cross-node parity.
 # M ingress pairs (port 38080+i, dst 10.0.0.(1+i)) + M backend bridges, K=M.
 set -u
 CORES=$1; W=$2; M=$3; MODE=${4:-load}
@@ -48,13 +49,13 @@ step "   $LIS/$M listening"
 
 if [ "$MODE" = "curl" ]; then
     step "4. preflight: 1 request (port 38080 only; sequential closes risk the teardown segfault)"
-    timeout 30 ssh $HOST "echo -n '  port 38080: '; curl -s -o /dev/null -w '%{http_code} in %{time_total}s\n' --max-time 8 --http2-prior-knowledge http://127.0.0.1:38080/" </dev/null 2>&1
+    timeout 30 ssh $HOST "echo -n '  port 38080: '; curl -s -o /dev/null -w '%{http_code} in %{time_total}s\n' --max-time 8 --http2-prior-knowledge http://127.0.0.1:38080${H2PATH:-/}" </dev/null 2>&1
     step "PREFLIGHT DONE"; cleanup; exit 0
 fi
 
 step "4. h2load x$M (timed 10s, warmup 3s, -c1 -m300)"
 (sleep 8; mpstat -P ALL 4 1 2>/dev/null | awk '/Average/ && $2!="CPU" {busy+=100-$NF; n++} END{printf "[mpstat] DPU busy cores ~= %.1f / %d\n", busy/100, n}') &
-timeout 120 ssh $HOST "for i in \$(seq 0 $((M-1))); do h2load --duration=10 --warm-up-time=3 -c1 -m300 http://127.0.0.1:\$((38080+i))/ > /tmp/ym_h2_\$i.log 2>&1 & done; wait; python3 -c \"
+timeout 120 ssh $HOST "for i in \$(seq 0 $((M-1))); do h2load --duration=10 --warm-up-time=3 -c1 -m300 http://127.0.0.1:\$((38080+i))${H2PATH:-/} > /tmp/ym_h2_\$i.log 2>&1 & done; wait; python3 -c \"
 import re,glob
 t=0; n=0; ok=0
 for f in sorted(glob.glob('/tmp/ym_h2_*.log')):
