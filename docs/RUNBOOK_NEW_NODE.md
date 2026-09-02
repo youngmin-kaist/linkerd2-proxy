@@ -61,3 +61,15 @@ cd ~/hotelres-dmesh && patch -p1 < <DPUMesh>/dmeshgo/dsb-integration.patch
 - 채널은 1회용: 프로세스가 죽거나 gRPC가 재다이얼하면 그 엣지는 wedge(재연결 abort). 장수 연결 전제.
 - DPA 슬롯 워커당 16(`DPA_THREAD_POOL_SIZE`/`DMESH_MAX_CONNECTIONS`/`MAX_CONNS` 세 곳 동기).
 - 두 host 프로세스가 같은 host DPA를 못 씀(flexio 프로세스당 1 함수) — 브리지만 해당, dmeshgo는 무관.
+
+## 7. 노드별 값 (확인된 것)
+| 노드 | DPU dev / rep | host PF | IP | 비고 |
+|---|---|---|---|---|
+| rapids4 + BF-3 (CLAUDE.md 기준) | `03:00.1` / `94:00.1` | `94:00.0`/`94:00.1` (`94:00.2`=mgmt) | host `.1`, DPU `.2` | 기본 스크립트 값 |
+| **jet1 + BF-3** (jet-bf-dmesh 세션 보고, 2026-09-02) | `03:00.1` / **`0b:00.1`** | **`0b:00.0`/`0b:00.1`** (`0b:00.2`=mgmt) | host `192.168.100.1`, DPU `.2` | 모든 host PCI가 `0b:00.x` |
+
+- **host 리버스 DPA(브리지 경로) 전제조건** — jet1에서 발견: host vhca용 DPA EU 파티션이 없으면
+  `doca_dpa_start`가 `flexio_prm_create_process`에서 실패(root여도). 먼저
+  `dpaeumgmt partition create -d mlx5_0 --vhca_list 0 --range_eus 0-63 --max_num_eu_group 1`.
+  dmeshgo(DSB) 경로는 host DPA를 쓰지 않으므로 해당 없음; `dm-echo`/DSB만 돌리면 생략 가능.
+  (이 세션(rapids4)에서는 미검증 — jet1 보고 그대로 기록.)
