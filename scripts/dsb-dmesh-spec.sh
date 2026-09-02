@@ -25,7 +25,7 @@ spec='$SPEC'; d={}
 for kv in [x for x in spec.split(',') if x]:
     k,v=kv.split(':'); d[k]=int(v)
 print(sum(d.get(s,1) for s in ['srv-geo','srv-rate','srv-search','srv-profile','srv-recommendation','srv-user','srv-reservation','srv-review','srv-attractions']))")
-timeout 120 ssh $HOST "bash /tmp/dsb_run_services.sh dmesh $W '$SPEC'" </dev/null 2>&1 | tail -1
+timeout 120 ssh $HOST "bash /tmp/dsb_run_services.sh dmesh $W '$SPEC' 4" </dev/null 2>&1 | tail -1
 for i in $(seq 1 40); do [ "$(grep -ac 'Push channel ready (mode 1)' $LOG/dproxy.log 2>/dev/null)" -ge "$EXP" ] && break; sleep 1; done
 B=$(grep -ac 'Push channel ready (mode 1)' $LOG/dproxy.log); step "backend listeners: $B/$EXP"; [ "$B" -ge "$EXP" ] || die "listeners"
 timeout 30 ssh $HOST 'curl -s -o /dev/null -w "preflight GET: %{http_code}\n" --max-time 15 "http://127.0.0.1:5000/hotels?inDate=2015-04-09&outDate=2015-04-10&lat=38.0235&lon=-122.095"; curl -s -o /dev/null -w "preflight reservation POST: %{http_code}\n" --max-time 15 "http://127.0.0.1:5000/reservation?inDate=2015-04-09&outDate=2015-04-10&lat=38.0235&lon=-122.095&hotelId=8&customerName=t&username=Cornell_1&password=1111111111&number=1"' </dev/null 2>&1

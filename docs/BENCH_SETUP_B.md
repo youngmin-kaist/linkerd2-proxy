@@ -450,3 +450,20 @@ replica spec(`DMESH_REPLICAS`, 모든 main에 포트 오버라이드, spec 러�
   (`Unexpected error` 0 = 손상 아님; 원인 미상). 재연결 wedge가 지속 부하의 마지막 관문.
 - 통합 계층 보강: `DialReplicated` fast-path를 frontend 7엣지·search 2엣지 전부로 일반화
   (누락 시 해당 replica 타깃은 깨진 round_robin 경로로 감 — 이번에 발견·수정).
+
+### frontend ×4 + wrk2 ×4 (2026-09-02)
+
+frontend를 4개(:5000/:15000/:25000/:35000, `DMESH_PORT_OVERRIDE`, `DMESH_CLIENT_ID`로 src-port
+오프셋)로 띄우고 wrk2 4인스턴스(t4, 각 1개 frontend)를 동시 실행해 합산 (`scripts/fe4-run.sh`).
+
+| 구성 (warmed) | 부하 | TCP-direct | DPUMesh (W=16) |
+|---|---|---|---|
+| 믹스 C, FE×1 (참고) | c1024 R32000 | 14.2k, host 92% | 13.45k |
+| 믹스 C, FE×4 | 4×(c256 R8000) | 13.3k, host 92% | 슬롯 초과(팬인 4로 워커 4개가 10>8) |
+| 믹스 C, FE×4 | 4×(c512 R10000) | 11.7k (과포화 thrash) | — |
+| **믹스 D (res6 rate2 search2), FE×4** | 4×(c256 R8000) | **13.5k, host 93%** | **13.0k (96%), host 91%, DPU 6–8/16**, setup failed 0 |
+
+- **frontend replica는 피크를 올리지 못함** — frontend는 병목이 아니었음(4 프로세스 합 3.1코어,
+  4 인스턴스 처리량 완전 균등 ±1%). host 상한(~92–93%)과 memcached-reserve(~1.6코어) 결론 확정.
+- DMA FE×4는 팬인(백엔드당 클라 채널 4) 때문에 워커당 8슬롯 예산이 빠듯 → 백엔드 16개=워커당
+  1개인 믹스 D로 맞춤. 그 조건에서 **DPUMesh = TCP의 96%**, host busy 동등, DPU 7–8코어.
