@@ -68,8 +68,22 @@ cd ~/hotelres-dmesh && patch -p1 < <DPUMesh>/dmeshgo/dsb-integration.patch
 | rapids4 + BF-3 (CLAUDE.md 기준) | `03:00.1` / `94:00.1` | `94:00.0`/`94:00.1` (`94:00.2`=mgmt) | host `.1`, DPU `.2` | 기본 스크립트 값 |
 | **jet1 + BF-3** (jet-bf-dmesh 세션 보고, 2026-09-02) | `03:00.1` / **`0b:00.1`** | **`0b:00.0`/`0b:00.1`** (`0b:00.2`=mgmt) | host `192.168.100.1`, DPU `.2` | 모든 host PCI가 `0b:00.x` |
 
-- **host 리버스 DPA(브리지 경로) 전제조건** — jet1에서 발견: host vhca용 DPA EU 파티션이 없으면
+- **host 리버스 DPA(브리지 경로) 전제조건** — jet1에서 발견(파티션은 vhca 0 = host PF `0b:00.0`에만 만들어지므로 `DMESH_REV_PCI=0b:00.0`만 동작, `0b:00.1`은 여전히 실패; 프록시 자체의 DPU측 DPA는 root 파티션을 써서 무관): host vhca용 DPA EU 파티션이 없으면
   `doca_dpa_start`가 `flexio_prm_create_process`에서 실패(root여도). 먼저
   `dpaeumgmt partition create -d mlx5_0 --vhca_list 0 --range_eus 0-63 --max_num_eu_group 1`.
   dmeshgo(DSB) 경로는 host DPA를 쓰지 않으므로 해당 없음; `dm-echo`/DSB만 돌리면 생략 가능.
   (이 세션(rapids4)에서는 미검증 — jet1 보고 그대로 기록.)
+
+## 8. 벤치 함정 (노드 간 비교에서 실제로 시간을 잡아먹은 것)
+- **하네스 파라미터가 곧 수치다.** 1코어 h2load: 페어 수 M과 `-m`(파이프라이닝)에 강하게 의존.
+  rapids4: M=1 15.6k / M=2 16.0k / M=4 17.2k (`-m300`). jet: `-m100` 15.2k → `-m300` 20.4k(+35%).
+  노드 비교는 반드시 **같은 스크립트(sb-l7.sh), 같은 M, 같은 -m, 같은 백엔드 응답 크기**로.
+- **DPA ingress(`DMESH_BRIDGE_PORT`)는 브리지 시작 시점에 채널을 붙인다** → 프록시의 HTTP 감지
+  10s read timeout이 클라이언트 접속 전에 만료되면 `outbound_tcp_detect_http_results_total{result="read_timeout"}`
+  + `stack_create_total{…protocol="opaq"…}` = **조용한 L4 포워딩**(~4배 부풀린 수치, 예 62k vs 15k).
+  push ingress(sb-l7.sh)는 listen-first라 면역. 판정: `request_total != 0`, HPACK 헤더 절감 ~87%(진짜 종단) vs ~41%(포워딩).
+- **백엔드 nginx는 h2c 필수** (`listen … http2`). HTTP/1.1 전용이면 프록시의 h2 프리페이스에 400 후 닫혀
+  push 채널이 요청 1개 뒤 teardown됨.
+- 백엔드 응답 크기도 변수: rapids4 nginx 기본 페이지 896B, jet `return 200 "ok\n"` 3B.
+- DOCA 버전: rapids4 3.1.0105, jet 3.5.0098 — 같은 하네스에서 jet가 ~21k vs rapids4 ~17k(원인 분리 중).
+- jet 빌드는 `RUSTFLAGS="--cfg tokio_unstable"` 필요(kubert-prometheus-tokio), 프록시는 `sudo -E`(representor 열거 권한).
