@@ -167,7 +167,7 @@ pub enum DmeshEvent {
 }
 
 /// Max connection slots per driver (mirrors DMESH_MAX_CONNECTIONS).
-pub const MAX_CONNS: usize = 8;
+pub const MAX_CONNS: usize = 16;
 
 /// Max consumer-PE events drained per loop iteration, matching the C worker's
 /// DATA_DRAIN_BUDGET: bounds each wakeup so the control path cannot starve.

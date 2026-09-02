@@ -467,3 +467,16 @@ frontend를 4개(:5000/:15000/:25000/:35000, `DMESH_PORT_OVERRIDE`, `DMESH_CLIEN
   4 인스턴스 처리량 완전 균등 ±1%). host 상한(~92–93%)과 memcached-reserve(~1.6코어) 결론 확정.
 - DMA FE×4는 팬인(백엔드당 클라 채널 4) 때문에 워커당 8슬롯 예산이 빠듯 → 백엔드 16개=워커당
   1개인 믹스 D로 맞춤. 그 조건에서 **DPUMesh = TCP의 96%**, host busy 동등, DPU 7–8코어.
+
+### DPA 슬롯 상한 8→16 (2026-09-02)
+
+`DPA_THREAD_POOL_SIZE`/`DMESH_MAX_CONNECTIONS`/`MAX_CONNS`를 16으로 (W=16 → 256 DPA 스레드,
+생성 실패 0). 이전에 슬롯 초과로 불가였던 **믹스 C + FE×4**가 DMA에서 측정 가능해짐.
+
+| 믹스 C (res8 rate2 search2 profile2), FE×4, 4×(c256 R8000) | req/s | host | DPU |
+|---|---|---|---|
+| TCP-direct | 13.3k | 92% | — |
+| **DPUMesh, 슬롯 16** — 1런 / 2런(같은 스택) | **12.5k / 14.0k** | 92% | **9–10/16** |
+
+setup failed 0, no-free-slot 0, Unexpected 0. DPUMesh ≈ TCP 동등(94–105%), host 포화점 동일,
+DPU 사용은 채널 수 증가로 7–8 → 9–10코어. 팬인 큰 replica 토폴로지의 DMA 제약(슬롯) 해소.
