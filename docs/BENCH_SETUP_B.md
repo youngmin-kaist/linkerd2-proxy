@@ -426,3 +426,27 @@ shim.c의 마지막 `TODO(flow-control)`: **DPA가 DPU staging 링에 쓸 때 Ru
 
 Unexpected error 0, push gate held 0. **멀티-replica 피크 ≈ 10.9k req/s** (TCP res×4 12.1k의
 90%). 잔여: 부하 종료 후 유휴 전환 시 `setup failed`(재다이얼→wedge, 측정 무영향).
+
+### 전 서비스 replica 확장 — host 포화점 피크 (2026-09-02)
+
+replica spec(`DMESH_REPLICAS`, 모든 main에 포트 오버라이드, spec 러너)으로 서비스별 replica
+확장. TCP-direct로 믹스를 올리며 host 포화점을 탐색, 같은 spec을 DPUMesh(W=16)에 적용.
+
+| 믹스 (c1024 R32000, warmed) | TCP-direct | host busy | DPUMesh | host / DPU |
+|---|---|---|---|---|
+| A: res4 rate4 search2 profile2 geo2 | 12.8k | 32.6/36 (91%) | — | — |
+| B: res8 rate4 search4 profile2 geo2 recomm2 user2 | 13.7k | 33.4/36 (93%) | 슬롯 고갈(설정 불가) | — |
+| **C: res8 rate2 search2 profile2** | **14.2k** | **33.2/36 (92%)** | **13.45k** (2런 연속 12.8k/13.45k) | 32.3/36 / **7.0/16** |
+
+- **host 포화 상한 ≈ 92–93% busy.** 남은 ~7% idle은 CPU가 아니라 **memcached-reserve
+  단일 인스턴스(1.6코어)에 8개 reservation replica가 직렬화**되는 의존성 대기 — replica를
+  더 늘려도(B→C) 처리량·busy가 안 움직임. 100%에 가려면 memcached-reserve 샤딩(앱 수정) 필요.
+- 이 지점의 피크: **TCP 14.2k vs DPUMesh 13.45k (95%)**, DPU는 7/16으로 여유 — 메시 L7을
+  DPU가 전담하면서 host 처리량 동등.
+- DPUMesh 제약 두 가지: ① **DPA 슬롯 워커당 8**(`DMESH_MAX_CONNECTIONS`/`DPA_THREAD_POOL_SIZE`)
+  — 믹스 B(rate×4를 search×4가 각각 다이얼 → rate만 24슬롯)는 `setup failed`로 불가. 워커
+  배정은 전역 채널 인덱스(`gid%W`)로 균등화했으나 팬인 큰 서비스는 한계. 상한 확대(16/워커)는
+  DPA 리소스 검증 후 후속. ② 믹스 C 3번째 런에서 채널 사망→재다이얼 wedge로 2.8k 붕괴
+  (`Unexpected error` 0 = 손상 아님; 원인 미상). 재연결 wedge가 지속 부하의 마지막 관문.
+- 통합 계층 보강: `DialReplicated` fast-path를 frontend 7엣지·search 2엣지 전부로 일반화
+  (누락 시 해당 replica 타깃은 깨진 round_robin 경로로 감 — 이번에 발견·수정).
