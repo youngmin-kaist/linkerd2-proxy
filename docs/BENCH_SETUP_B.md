@@ -352,3 +352,29 @@ teardown한 슬롯이라 abort → TRANSIENT_FAILURE 고착. 채널 keepalive/id
 
 현 상태 확정 수치: DPUMesh **N=1 = 7,022 req/s(안정)**, res×4는 재연결 뿌리문제로 측정불가.
 TCP-direct res×4 = 12.1k(참고).
+
+### 근본원인 확정: 채널은 "끊기는" 게 아니라 push 흐름제어 부재로 손상/정체 (2026-09-02)
+
+**관측 (res×4, 부하 에스컬레이션)**: c256 R12000 = **8,420 req/s 정상 완주**(TRANSIENT 0).
+c512 R16000에서 붕괴 — 그런데 **TRANSIENT_FAILURE 0, 연결 유지, 단일 요청까지 TIMEOUT**
+= 재연결이 아니라 **영구 hang**.
+
+**코드 확정 (dma.c push 경로)**: DPU→host push에 흐름제어가 전혀 없음.
+1. 데이터 링: `push_pos`는 DPU 자체 커서 — host 소비 위치 확인 없이 wrap하며 덮어씀.
+2. desc slot 링(128): `seq%128` 슬롯에 무조건 발행 — host `expected`가 128 뒤처지면
+   미소비 슬롯을 새 seq로 덮어씀 → host는 expected seq를 영원히 못 만나 **영구 stall**.
+3. host 소비측은 pend(8MB) 초과 시 소비 중단 → 2번 즉시 발동. (host→DPU sndbuf도 동일
+   구조적 문제.)
+
+**"채널이 왜 끊기나"의 답**: 덮어쓰기가 h2 프레임을 어긋나게 읽히면 gRPC가 connection
+error로 연결을 닫고 재다이얼(→teardown된 슬롯이라 CONNECTION_ABORTED — 이전 관측),
+바이트가 조용히 소실되면 hang(오늘 관측). 동전의 양면, 뿌리는 하나 = **push 전송의
+backpressure 부재** (shim.c의 기존 TODO(flow-control)와 일치). c512는 in-flight 응답
+바이트가 host 소비 속도를 초과하는 임계.
+
+**수정 방향**: forward 방향의 `dma_ring_ctrl.consumer_head` 패턴을 push에도 —
+host가 소비 커서를 공유 ctrl에 기록, DPU는 (seq - host_consumed) < 128 && 데이터링
+여유 있을 때만 발행, 아니면 push 보류(tx_staging에 자연 축적 = 상류 backpressure).
+
+**중간 성과**: res×4 = **8,420 req/s @ c256** (N=1 7.0k 대비 +20%, 멀티-replica 스케일링
+실증) — 흐름제어 한계 내에서는 이미 동작.
