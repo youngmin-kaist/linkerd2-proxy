@@ -480,3 +480,11 @@ frontend를 4개(:5000/:15000/:25000/:35000, `DMESH_PORT_OVERRIDE`, `DMESH_CLIEN
 
 setup failed 0, no-free-slot 0, Unexpected 0. DPUMesh ≈ TCP 동등(94–105%), host 포화점 동일,
 DPU 사용은 채널 수 증가로 7–8 → 9–10코어. 팬인 큰 replica 토폴로지의 DMA 제약(슬롯) 해소.
+
+### 1 DPU Arm 코어 linkerd 피크 재측정 (2026-09-03, 3-방향 FC·슬롯16 이후)
+
+| 하네스 (1코어, sharded W=1) | 결과 | 비고 |
+|---|---|---|
+| `sb-l7.sh 1 1 4` — h2load -c1 -m300 ×4 페어, nginx, h2 종단 | **17,155 req/s** (M=2: 16,023) | 이전 곡선 1코어 17.2k와 일치 → FC/슬롯 변경 회귀 없음 |
+| `dm-bench.sh 1 2` — gRPC 64B unary 에코(dmeshgo), P=2 M=64 | **12,887 req/s** (P=1: 10,285) | 이전 13.1k와 일치 |
+DPU busy ≈1.2–1.4/16 (핀 코어 1 + 드라이버/PE 잔여).
