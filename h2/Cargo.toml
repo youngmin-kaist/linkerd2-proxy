@@ -1,0 +1,81 @@
+# h2 0.4.15 from crates.io, carried here so two send-path changes can be
+# applied: a stream opens on the caller's thread when nothing waits ahead of
+# it, and a closed stream wakes the connection only when the connection may
+# close. Everything else is upstream.
+[package]
+edition = "2021"
+rust-version = "1.63"
+name = "h2"
+version = "0.4.15"
+authors = [
+    "Carl Lerche <me@carllerche.com>",
+    "Sean McArthur <sean@seanmonstar.com>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "An HTTP/2 client and server"
+documentation = "https://docs.rs/h2"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/hyperium/h2"
+publish = false
+
+[features]
+stream = []
+unstable = []
+
+[lib]
+name = "h2"
+path = "src/lib.rs"
+
+[dependencies.atomic-waker]
+version = "1.0.0"
+
+[dependencies.bytes]
+version = "1"
+
+[dependencies.fnv]
+version = "1.0.5"
+
+[dependencies.futures-core]
+version = "0.3"
+default-features = false
+
+[dependencies.futures-sink]
+version = "0.3"
+default-features = false
+
+[dependencies.http]
+version = "1.1"
+
+[dependencies.indexmap]
+version = "2"
+features = ["std"]
+
+[dependencies.slab]
+version = "0.4.2"
+
+[dependencies.tokio]
+version = "1"
+features = ["io-util"]
+
+[dependencies.tokio-util]
+version = "0.7.1"
+features = [
+    "codec",
+    "io",
+]
+
+[dependencies.tracing]
+version = "0.1.35"
+features = ["std"]
+default-features = false
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(fuzzing)"]
