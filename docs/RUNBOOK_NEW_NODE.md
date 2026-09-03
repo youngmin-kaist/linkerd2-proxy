@@ -49,8 +49,12 @@ dmeshgo(Go)는 cgo로 `${SRCDIR}/../build/libdmesh_host.so`를 rpath로 찾는�
 cp -r DeathStarBench/hotelReservation ~/hotelres-dmesh
 cd ~/hotelres-dmesh && patch -p1 < <DPUMesh>/dmeshgo/dsb-integration.patch
 ```
+- 패치는 `diff -ruN`으로 생성 — **새 파일(`dmesh/dmesh.go`, `dmesh/balanced.go`, `go.sum`)을 포함**한다.
+  (초기 버전은 `-N` 없이 만들어져 `dmesh/` 패키지가 빠졌었음 — jet에서 발견.) 만약을 위해 같은 소스가
+  `<DPUMesh>/dmeshgo/dsb/dmesh/*.go`에 평문으로도 있다: 패치 적용 후 `hotelReservation/dmesh/`가 비어 있으면 거기서 복사.
 - 패치 안 `go.mod`의 `replace dmeshgo => /home/youngmin/bf-workspace/dmeshgo` 는 **절대경로** → 새 노드
-  경로로 수정. `vendor/`는 삭제(cgo SRCDIR을 깨뜨림). `go build -buildvcs=false -o bin/<svc> ./cmd/<svc>`.
+  경로로 수정(사용자명/배치가 같으면 그대로). `vendor/`는 삭제(cgo SRCDIR을 깨뜨림). go.sum이 패치에
+  포함되지만 의존성이 어긋나면 `go mod tidy` 한 번. `go build -buildvcs=false -o bin/<svc> ./cmd/<svc>`.
 - 인프라: `docker compose up -d consul jaeger mongodb-* memcached-*` 후 `dmeshgo/dsb_host_setup.py`가
   컨테이너 브리지 IP로 `config.json` 생성. 서비스는 bare 프로세스(`dmeshgo/dsb_run_services.sh`).
 - 실행: 베이스라인 `dsb_run_services.sh tcp`, DMA는 DPU에서 `scripts/dsb-dmesh-spec.sh <W> "<replica spec>"`
