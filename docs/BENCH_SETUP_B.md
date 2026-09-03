@@ -505,3 +505,5 @@ jet가 더 빠름**. 응답 크기를 맞추자(`H2PATH=/ok`, 3B) 격차가 4k�
 - 잔여 ~8%의 후보: DOCA 3.1 vs 3.5, host CPU/h2load(1.43 vs 1.59), Arm 클럭(rapids4 미측정, perf 없음; jet 2.133GHz).
   PCIe는 양쪽 Gen5 x16으로 동일.
 - 하네스 민감도(jet): `-m100`→`-m300` +35%; DPA ingress vs push ingress <1%.
+- **Arm 클럭 실측**(scripts/armclk.c, add-chain 프로브): rapids4 core15 **2.112 GHz** vs jet 2.127–2.133 → 0.9% 차이뿐.
+  per GHz-core: rapids4 9.19k vs jet 9.89k → **잔여 ~7%는 클럭이 아님**. 남은 후보 = DOCA 3.1 vs 3.5, host 클라이언트측(6554S+h2load 1.43 vs 6515P+1.59).
