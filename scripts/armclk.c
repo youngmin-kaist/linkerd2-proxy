@@ -4,7 +4,9 @@
  * == cycles. Validated vs perf on jet1: 2.127 vs 2.133 GHz (0.3%). Build:
  * gcc -O2 -o armclk armclk.c ; run pinned on an idle core: taskset -c 15 ./armclk
  * Bind registers through operands (as here) - hardcoding x0/x1 via
- * register-asm mis-binds and the loop never terminates. (from jet-bf-dmesh) */
+ * register-asm mis-binds and the loop never terminates. (from jet-bf-dmesh)
+ * PORTABILITY: assumes ALU latency 1 for the add chain - true on Cortex-A78/A78AE;
+ * re-validate against perf before trusting it on any other core. */
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
