@@ -83,6 +83,58 @@ pub struct SessionMetrics {
     pub session_stack_service_nanoseconds: Counter,
     /// Slots withdrawn from reuse because their generation space ran out.
     pub slots_retired: Gauge,
+    /// Calls into the C worker's drain path.
+    pub worker_drain_calls: Counter,
+    /// Drain calls that moved Linkerd or transport work.
+    pub worker_drain_progressed: Counter,
+    /// Drain calls that retained work behind backpressure.
+    pub worker_drain_pending: Counter,
+    /// Drain calls that found no work.
+    pub worker_drain_idle: Counter,
+    /// Drain calls where the completion PE made progress.
+    pub worker_pe_progressed: Counter,
+    /// Drain calls where the routing/proxy path made progress.
+    pub worker_data_progressed: Counter,
+    /// Times the runtime armed its notification sources.
+    pub worker_arms: Counter,
+    /// Times the runtime cleared armed notification sources.
+    pub worker_notification_clears: Counter,
+    /// Worker maintenance calls. This must continue advancing even when idle.
+    pub worker_maintenances: Counter,
+    /// DPA completions processed by their local worker.
+    pub worker_local_completions: Counter,
+    /// Completions handed to a different worker.
+    pub worker_cross_out: Counter,
+    /// Cross-worker completions consumed by their owner.
+    pub worker_cross_in: Counter,
+    /// Milliseconds since this runtime last made observable progress.
+    pub worker_last_progress_age_milliseconds: Gauge,
+    /// Completions waiting on the worker's DPA receive queue.
+    pub worker_completion_queue_depth: Gauge,
+    /// Completions waiting in the cross-worker handoff queue.
+    pub worker_cross_queue_depth: Gauge,
+    /// Receive tasks held back by queue pressure.
+    pub worker_deferred_receives: Gauge,
+    /// Submitted DMA tasks whose callbacks have not completed.
+    pub worker_dma_tasks_inflight: Gauge,
+    /// DMA batches waiting for a serialized retry probe.
+    pub worker_dma_retry_batches: Gauge,
+    /// Whether the worker's DMA context is faulted.
+    pub worker_dma_stalled: Gauge,
+    /// Connections parked behind proxy resource pressure.
+    pub worker_stalled_connections: Gauge,
+    /// Whether completed output still waits to be emitted.
+    pub worker_emit_pending: Gauge,
+    /// ACK releases waiting in the worker queue.
+    pub worker_ack_release_depth: Gauge,
+    /// Whether an ACK release waits on the fallback retry list.
+    pub worker_ack_retry_pending: Gauge,
+    /// Remote FINs waiting for landing-lane space.
+    pub worker_remote_fin_pending: Gauge,
+    /// Whether the worker currently considers itself parked.
+    pub worker_parked: Gauge,
+    /// Whether its explicit wake eventfd holds a posted tick.
+    pub worker_wake_posted: Gauge,
     /// Sessions the adapter refused, by the cause it refused them for.
     pub sessions_declined: Family<DeclineLabels, Counter>,
 }
@@ -195,6 +247,136 @@ impl SessionMetrics {
             metrics.slots_retired.clone(),
         );
         registry.register(
+            "worker_drain_calls",
+            "Calls into the DPUmesh worker drain path",
+            metrics.worker_drain_calls.clone(),
+        );
+        registry.register(
+            "worker_drain_progressed",
+            "DPUmesh worker drain calls that made progress",
+            metrics.worker_drain_progressed.clone(),
+        );
+        registry.register(
+            "worker_drain_pending",
+            "DPUmesh worker drain calls retaining pending work",
+            metrics.worker_drain_pending.clone(),
+        );
+        registry.register(
+            "worker_drain_idle",
+            "DPUmesh worker drain calls that found no work",
+            metrics.worker_drain_idle.clone(),
+        );
+        registry.register(
+            "worker_pe_progressed",
+            "DPUmesh worker drains progressed by the completion PE",
+            metrics.worker_pe_progressed.clone(),
+        );
+        registry.register(
+            "worker_data_progressed",
+            "DPUmesh worker drains progressed by routing or proxy work",
+            metrics.worker_data_progressed.clone(),
+        );
+        registry.register(
+            "worker_arms",
+            "DPUmesh worker notification arm calls",
+            metrics.worker_arms.clone(),
+        );
+        registry.register(
+            "worker_notification_clears",
+            "DPUmesh worker notification clear calls",
+            metrics.worker_notification_clears.clone(),
+        );
+        registry.register(
+            "worker_maintenances",
+            "DPUmesh worker maintenance calls",
+            metrics.worker_maintenances.clone(),
+        );
+        registry.register(
+            "worker_local_completions",
+            "DPA completions processed by their local DPUmesh worker",
+            metrics.worker_local_completions.clone(),
+        );
+        registry.register(
+            "worker_cross_out",
+            "DPA completions handed to another DPUmesh worker",
+            metrics.worker_cross_out.clone(),
+        );
+        registry.register(
+            "worker_cross_in",
+            "Cross-worker completions processed by their owner",
+            metrics.worker_cross_in.clone(),
+        );
+        registry.register(
+            "worker_last_progress_age_milliseconds",
+            "Milliseconds since the DPUmesh worker last made progress",
+            metrics.worker_last_progress_age_milliseconds.clone(),
+        );
+        registry.register(
+            "worker_completion_queue_depth",
+            "DPA receive completions waiting on this DPUmesh worker",
+            metrics.worker_completion_queue_depth.clone(),
+        );
+        registry.register(
+            "worker_cross_queue_depth",
+            "Cross-worker completions waiting on this DPUmesh worker",
+            metrics.worker_cross_queue_depth.clone(),
+        );
+        registry.register(
+            "worker_deferred_receives",
+            "Receive tasks held back by DPUmesh completion queue pressure",
+            metrics.worker_deferred_receives.clone(),
+        );
+        registry.register(
+            "worker_dma_tasks_inflight",
+            "DPUmesh DMA tasks waiting for completion callbacks",
+            metrics.worker_dma_tasks_inflight.clone(),
+        );
+        registry.register(
+            "worker_dma_retry_batches",
+            "DPUmesh DMA batches waiting for retry",
+            metrics.worker_dma_retry_batches.clone(),
+        );
+        registry.register(
+            "worker_dma_stalled",
+            "Whether the DPUmesh worker DMA context is faulted",
+            metrics.worker_dma_stalled.clone(),
+        );
+        registry.register(
+            "worker_stalled_connections",
+            "DPUmesh connections parked behind proxy resource pressure",
+            metrics.worker_stalled_connections.clone(),
+        );
+        registry.register(
+            "worker_emit_pending",
+            "Whether DPUmesh output waits for completion emission",
+            metrics.worker_emit_pending.clone(),
+        );
+        registry.register(
+            "worker_ack_release_depth",
+            "DPUmesh ACK releases waiting in the worker queue",
+            metrics.worker_ack_release_depth.clone(),
+        );
+        registry.register(
+            "worker_ack_retry_pending",
+            "Whether a DPUmesh ACK release waits on the retry list",
+            metrics.worker_ack_retry_pending.clone(),
+        );
+        registry.register(
+            "worker_remote_fin_pending",
+            "Remote FINs waiting for DPUmesh landing-lane space",
+            metrics.worker_remote_fin_pending.clone(),
+        );
+        registry.register(
+            "worker_parked",
+            "Whether the DPUmesh worker considers itself parked",
+            metrics.worker_parked.clone(),
+        );
+        registry.register(
+            "worker_wake_posted",
+            "Whether the DPUmesh worker wake eventfd holds a posted tick",
+            metrics.worker_wake_posted.clone(),
+        );
+        registry.register(
             "sessions_declined",
             "DPUmesh sessions the adapter refused, by cause",
             metrics.sessions_declined.clone(),
@@ -244,7 +426,10 @@ impl SessionMetrics {
              tasks={} cancelled={} take_errors={} target_mismatches={} \
              session_mismatches={} sessionless_refusals={} stack_builds={} \
              stack_hits={} stack_misses={} \
-             stack_configure_ns={} stack_layers_ns={} stack_service_ns={} retired_slots={}",
+             stack_configure_ns={} stack_layers_ns={} stack_service_ns={} retired_slots={} \
+             worker_drains={} worker_progressed={} progress_age_ms={} completion_q={} \
+             cross_q={} deferred_recv={} dma_inflight={} dma_retries={} dma_stalled={} \
+             stalled_conns={} emit_pending={} ack_release_q={} ack_retry={} remote_fin={}",
             self.sessions_opened.get(),
             self.sessions_closed.get(),
             self.sessions_active.get(),
@@ -264,6 +449,20 @@ impl SessionMetrics {
             self.session_stack_layers_nanoseconds.get(),
             self.session_stack_service_nanoseconds.get(),
             self.slots_retired.get(),
+            self.worker_drain_calls.get(),
+            self.worker_drain_progressed.get(),
+            self.worker_last_progress_age_milliseconds.get(),
+            self.worker_completion_queue_depth.get(),
+            self.worker_cross_queue_depth.get(),
+            self.worker_deferred_receives.get(),
+            self.worker_dma_tasks_inflight.get(),
+            self.worker_dma_retry_batches.get(),
+            self.worker_dma_stalled.get(),
+            self.worker_stalled_connections.get(),
+            self.worker_emit_pending.get(),
+            self.worker_ack_release_depth.get(),
+            self.worker_ack_retry_pending.get(),
+            self.worker_remote_fin_pending.get(),
         )
     }
 }
@@ -288,6 +487,14 @@ mod tests {
         prometheus_client::encoding::text::encode(&mut encoded, &registry).unwrap();
         assert!(encoded.contains("sessions_opened_total 1"), "{encoded}");
         assert!(encoded.contains("sessions_active 1"), "{encoded}");
+        assert!(
+            encoded.contains("worker_drain_calls_total 0"),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains("worker_dma_tasks_inflight 0"),
+            "{encoded}"
+        );
         assert!(
             encoded.contains("session_stack_builds_total 1"),
             "{encoded}"
