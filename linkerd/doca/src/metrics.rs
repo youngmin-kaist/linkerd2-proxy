@@ -43,6 +43,12 @@ pub fn record_control_event(kind: &str, reason: &str) {
 
 #[derive(Debug, Default)]
 pub struct SessionMetrics {
+    pub tx_accepted_bytes: Counter,
+    pub tx_arena_copy_bytes: Counter,
+    pub tx_publications: Counter,
+    pub tx_retries: Counter,
+    pub tx_errors: Counter,
+
     /// Sessions the adapter opened.
     pub sessions_opened: Counter,
     /// Sessions the adapter closed.
@@ -151,6 +157,28 @@ impl SessionMetrics {
     /// same counters.
     pub fn register(registry: &mut Registry) -> Arc<Self> {
         let metrics = Self::default();
+        registry.register(
+            "tx_accepted_bytes",
+            "Bytes published to C DMA or peer custody (excludes buffered arena bytes)",
+            metrics.tx_accepted_bytes.clone(),
+        );
+        registry.register(
+            "tx_arena_copy_bytes",
+            "Bytes copied into the TX arena including rejected attempts",
+            metrics.tx_arena_copy_bytes.clone(),
+        );
+        registry.register(
+            "tx_publications",
+            "Arena batches transferred to C DMA or peer custody",
+            metrics.tx_publications.clone(),
+        );
+        registry.register(
+            "tx_retries",
+            "Writes refused by a full batch or a dry arena, and refused batch publications",
+            metrics.tx_retries.clone(),
+        );
+        registry.register("tx_errors", "Terminal TX errors", metrics.tx_errors.clone());
+
         registry.register(
             "sessions_opened",
             "DPUmesh sessions opened",
@@ -487,14 +515,8 @@ mod tests {
         prometheus_client::encoding::text::encode(&mut encoded, &registry).unwrap();
         assert!(encoded.contains("sessions_opened_total 1"), "{encoded}");
         assert!(encoded.contains("sessions_active 1"), "{encoded}");
-        assert!(
-            encoded.contains("worker_drain_calls_total 0"),
-            "{encoded}"
-        );
-        assert!(
-            encoded.contains("worker_dma_tasks_inflight 0"),
-            "{encoded}"
-        );
+        assert!(encoded.contains("worker_drain_calls_total 0"), "{encoded}");
+        assert!(encoded.contains("worker_dma_tasks_inflight 0"), "{encoded}");
         assert!(
             encoded.contains("session_stack_builds_total 1"),
             "{encoded}"
