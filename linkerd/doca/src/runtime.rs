@@ -25,11 +25,20 @@ pub struct NotificationFds {
     pub wake: RawFd,
 }
 
+/// Notification sources a pass saw readable. Only those are cleared: clearing
+/// a source that did not fire is a read that returns nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Fired {
+    pub completion: bool,
+    pub dma: bool,
+    pub wake: bool,
+}
+
 pub trait RuntimeBackend {
     fn notification_fds(&mut self) -> io::Result<NotificationFds>;
     fn arm(&mut self) -> io::Result<()>;
     fn drain(&mut self, budget: usize) -> io::Result<Progress>;
-    fn clear_notifications(&mut self) -> io::Result<()>;
+    fn clear_notifications(&mut self, fired: Fired) -> io::Result<()>;
     fn maintenance(&mut self) -> io::Result<()>;
     fn poll_internal(&mut self, cx: &mut Context<'_>) -> Poll<()>;
     fn stopped(&self) -> bool;
@@ -54,6 +63,20 @@ async fn readable(fd: Option<&AsyncFd<BorrowedFd>>) -> io::Result<()> {
             Ok(())
         }
         None => pending().await,
+    }
+}
+
+/// Whether an edge arrived on `fd` since it was last cleared, consuming it.
+/// A source that becomes readable right after this answer is still reported
+/// by the next wait: readiness is sticky until cleared.
+fn seen(fd: Option<&AsyncFd<BorrowedFd>>) -> bool {
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    match fd.map(|fd| fd.poll_read_ready(&mut cx)) {
+        Some(Poll::Ready(Ok(mut guard))) => {
+            guard.clear_ready();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -88,6 +111,19 @@ pub async fn run<B: RuntimeBackend>(mut backend: B) -> io::Result<()> {
         // maintenance deadline says something moved. Nothing is dropped: every
         // pass drains before it waits.
         let mut internal_armed = true;
+        // One timer entry serves every wait; registering a timer wakes the
+        // runtime's driver, so the entry is only reset once per period.
+        let mut maintenance = std::pin::pin!(tokio::time::sleep_until(next_maintenance));
+        // The sources whose edges were consumed by the wait just completed.
+        let seen_all = |completion: &AsyncFd<BorrowedFd>,
+                        dma: Option<&AsyncFd<BorrowedFd>>,
+                        wake: &AsyncFd<BorrowedFd>,
+                        mut fired: Fired| {
+            fired.completion |= seen(Some(completion));
+            fired.dma |= seen(dma);
+            fired.wake |= seen(Some(wake));
+            fired
+        };
         backend.ready();
 
         while !backend.stopped() {
@@ -95,6 +131,7 @@ pub async fn run<B: RuntimeBackend>(mut backend: B) -> io::Result<()> {
             if now >= next_maintenance {
                 backend.maintenance()?;
                 next_maintenance = now + MAINTENANCE_PERIOD;
+                maintenance.as_mut().reset(next_maintenance);
             }
 
             if backend.drain(DRAIN_BUDGET)? == Progress::Progressed {
@@ -109,36 +146,50 @@ pub async fn run<B: RuntimeBackend>(mut backend: B) -> io::Result<()> {
             backend.arm()?;
             if backend.drain(DRAIN_BUDGET)? == Progress::Progressed {
                 internal_armed = true;
-                backend.clear_notifications()?;
+                backend.clear_notifications(seen_all(
+                    &completion,
+                    dma.as_ref(),
+                    &wake,
+                    Fired::default(),
+                ))?;
                 tokio::task::yield_now().await;
                 continue;
             }
             if backend.stopped() {
-                backend.clear_notifications()?;
+                backend.clear_notifications(seen_all(
+                    &completion,
+                    dma.as_ref(),
+                    &wake,
+                    Fired::default(),
+                ))?;
                 break;
             }
 
+            let mut fired = Fired::default();
             tokio::select! {
                 result = readable(Some(&completion)) => {
                     internal_armed = true;
+                    fired.completion = true;
                     result?
                 },
                 result = readable(dma.as_ref()) => {
                     internal_armed = true;
+                    fired.dma = true;
                     result?
                 },
                 result = readable(Some(&wake)) => {
                     internal_armed = true;
+                    fired.wake = true;
                     result?
                 },
                 _ = std::future::poll_fn(|cx| backend.poll_internal(cx)), if internal_armed => {
                     internal_armed = false;
                 },
-                _ = tokio::time::sleep_until(next_maintenance) => {
+                _ = maintenance.as_mut() => {
                     internal_armed = true;
                 },
             }
-            backend.clear_notifications()?;
+            backend.clear_notifications(seen_all(&completion, dma.as_ref(), &wake, fired))?;
         }
         Ok(())
     }
@@ -193,7 +244,7 @@ mod tests {
             Ok(Progress::Idle)
         }
 
-        fn clear_notifications(&mut self) -> io::Result<()> {
+        fn clear_notifications(&mut self, _fired: Fired) -> io::Result<()> {
             Ok(())
         }
 
@@ -292,7 +343,7 @@ mod tests {
             Ok(Progress::Idle)
         }
 
-        fn clear_notifications(&mut self) -> io::Result<()> {
+        fn clear_notifications(&mut self, _fired: Fired) -> io::Result<()> {
             Ok(())
         }
 
@@ -341,6 +392,10 @@ mod tests {
         );
         // Reaching the deadline is what a pass that waits does, and a pass that
         // does not wait never reaches it.
-        assert!(state.maintenances > 1, "maintenances {}", state.maintenances);
+        assert!(
+            state.maintenances > 1,
+            "maintenances {}",
+            state.maintenances
+        );
     }
 }
