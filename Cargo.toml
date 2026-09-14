@@ -5,6 +5,7 @@ resolver = "2"
 
 members = [
     "dmesh-router",
+    "vendor/h2",
     "hyper-balance",
     "linkerd/addr",
     "linkerd/app/admin",
@@ -96,6 +97,7 @@ members = [
 [profile.release]
 debug = 1
 lto = true
+codegen-units = 1
 
 [workspace.package]
 version = "0.1.0"

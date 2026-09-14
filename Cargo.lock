@@ -738,6 +738,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "env_logger"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,15 +1042,24 @@ version = "0.4.14"
 dependencies = [
  "atomic-waker",
  "bytes",
+ "env_logger",
  "fnv",
  "futures-core",
  "futures-sink",
+ "hex",
  "http",
  "indexmap 2.13.0",
+ "quickcheck",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
  "slab",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
+ "walkdir",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1240,6 +1258,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -5072,6 +5091,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

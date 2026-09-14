@@ -51,7 +51,7 @@ export MOCK_DESTINATION_BACKEND="${MOCK_DESTINATION_BACKEND:-127.0.0.1:8086}"
 export MOCK_POLICY_BACKEND="${MOCK_POLICY_BACKEND:-127.0.0.1:8086}"
 
 export LINKERD2_PROXY_LOG="${LINKERD2_PROXY_LOG:-linkerd=debug,info}"
-export RUSTFLAGS="${RUSTFLAGS:---cfg tokio_unstable}"
+export RUSTFLAGS="${RUSTFLAGS:---cfg tokio_unstable -C target-cpu=native}"
 
 
 export LINKERD2_PROXY_DOCA_DEV_PCI_ADDR="03:00.1"
