@@ -343,6 +343,9 @@ pub struct Builder {
     ///
     /// When this gets exceeded, we issue GOAWAYs.
     local_max_error_reset_streams: Option<usize>,
+
+    /// Selective header decoding (see [`Builder::selective_headers`]).
+    selective: Option<crate::hpack::NeededSet>,
 }
 
 #[derive(Debug)]
@@ -663,7 +666,24 @@ impl Builder {
             settings: Default::default(),
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
+            selective: None,
         }
+    }
+
+    /// Enables selective header decoding on connections made with this
+    /// builder (default: off, stock behaviour).
+    ///
+    /// A request carrying [`crate::selective::RawHeaderReps`] in its
+    /// extensions (e.g. one received on a selective server connection) is
+    /// encoded by re-indexing those representations toward the server rather
+    /// than by re-encoding its `HeaderMap`; received response blocks are
+    /// walked against a mirror of the server's HPACK table, the response's
+    /// `HeaderMap` holds **only** the pseudo-headers and the names in
+    /// `needed`, and the raw representations ride in the response
+    /// extensions. See `crate::selective`.
+    pub fn selective_headers(&mut self, needed: crate::selective::NeededSet) -> &mut Self {
+        self.selective = Some(needed);
+        self
     }
 
     /// Indicates the initial window size (in octets) for stream-level
@@ -1319,6 +1339,10 @@ where
             codec.set_max_recv_header_list_size(max as usize);
         }
 
+        if let Some(needed) = &builder.selective {
+            codec.set_selective(needed.clone());
+        }
+
         // Send initial settings frame
         codec
             .buffer(builder.settings.clone().into())
@@ -1615,6 +1639,7 @@ impl Peer {
                 uri,
                 headers,
                 version,
+                mut extensions,
                 ..
             },
             _,
@@ -1657,6 +1682,10 @@ impl Peer {
         // Create the HEADERS frame
         let mut frame = Headers::new(id, pseudo, headers);
 
+        if let Some(reps) = extensions.remove::<crate::hpack::RawHeaderReps>() {
+            frame.set_reps(reps);
+        }
+
         if end_of_stream {
             frame.set_end_stream()
         }
@@ -1683,6 +1712,7 @@ impl proto::Peer for Peer {
     fn convert_poll_message(
         pseudo: Pseudo,
         fields: HeaderMap,
+        reps: Option<crate::hpack::RawHeaderReps>,
         stream_id: StreamId,
     ) -> Result<Self::Poll, Error> {
         let mut b = Response::builder();
@@ -1703,6 +1733,10 @@ impl proto::Peer for Peer {
         };
 
         *response.headers_mut() = fields;
+
+        if let Some(reps) = reps {
+            response.extensions_mut().insert(reps);
+        }
 
         Ok(response)
     }

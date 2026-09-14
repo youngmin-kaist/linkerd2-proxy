@@ -105,6 +105,11 @@ impl<T> FramedRead<T> {
     pub fn set_header_table_size(&mut self, val: usize) {
         self.hpack.queue_size_update(val);
     }
+
+    /// Selective header decoding (see `hpack::selective`).
+    pub fn set_selective(&mut self, needed: hpack::NeededSet) {
+        self.hpack.set_selective(needed);
+    }
 }
 
 fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
@@ -170,6 +175,10 @@ fn decode_frame(
             match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                Err(frame::Error::Hpack(hpack::DecoderError::Selective(e))) => {
+                    proto_err!(conn: "selective HPACK walk failed; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                },
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
@@ -342,6 +351,10 @@ fn decode_frame(
             {
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
+                Err(frame::Error::Hpack(hpack::DecoderError::Selective(e))) => {
+                    proto_err!(conn: "selective HPACK walk failed; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                }
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);

@@ -1,4 +1,6 @@
+use super::selective::{NeededSet, SelectiveEncoder};
 use super::table::{Index, Table};
+use super::transcode::TranscodeStats;
 use super::{huffman, Header};
 
 use bytes::{BufMut, BytesMut};
@@ -8,6 +10,9 @@ use http::header::{HeaderName, HeaderValue};
 pub struct Encoder {
     table: Table,
     size_update: Option<SizeUpdate>,
+    /// Selective mode: our table toward the peer is the re-indexing
+    /// `EncoderTable`; the stock `table` is then unused.
+    selective: Option<SelectiveEncoder>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -21,13 +26,40 @@ impl Encoder {
         Encoder {
             table: Table::new(max_size, capacity),
             size_update: None,
+            selective: None,
         }
+    }
+
+    /// Switch this encoder to selective mode (see `hpack::selective`). Must
+    /// be called before the first block is encoded.
+    pub fn set_selective(&mut self, needed: NeededSet) {
+        self.selective = Some(SelectiveEncoder::new(needed, self.table.max_size()));
+    }
+
+    /// Whether selective mode is on.
+    #[allow(dead_code)]
+    pub fn is_selective(&self) -> bool {
+        self.selective.is_some()
+    }
+
+    pub(crate) fn selective_mut(&mut self) -> Option<&mut SelectiveEncoder> {
+        self.selective.as_mut()
+    }
+
+    /// Transcode statistics of this connection so far (selective mode).
+    #[allow(dead_code)]
+    pub fn selective_stats(&self) -> Option<TranscodeStats> {
+        self.selective.as_ref().map(|s| s.stats)
     }
 
     /// Queues a max size update.
     ///
     /// The next call to `encode` will include a dynamic size update frame.
     pub fn update_max_size(&mut self, val: usize) {
+        if let Some(sel) = self.selective.as_mut() {
+            sel.table.resize(val);
+            return;
+        }
         match self.size_update {
             Some(SizeUpdate::One(old)) => {
                 if val > old {

@@ -1,5 +1,6 @@
 use crate::error::Reason;
 use crate::frame::{Pseudo, StreamId};
+use crate::hpack::RawHeaderReps;
 use crate::proto::{Error, Open};
 
 use http::{HeaderMap, Request, Response};
@@ -19,6 +20,7 @@ pub(crate) trait Peer {
     fn convert_poll_message(
         pseudo: Pseudo,
         fields: HeaderMap,
+        reps: Option<RawHeaderReps>,
         stream_id: StreamId,
     ) -> Result<Self::Poll, Error>;
 
@@ -61,13 +63,14 @@ impl Dyn {
         &self,
         pseudo: Pseudo,
         fields: HeaderMap,
+        reps: Option<RawHeaderReps>,
         stream_id: StreamId,
     ) -> Result<PollMessage, Error> {
         if self.is_server() {
-            crate::server::Peer::convert_poll_message(pseudo, fields, stream_id)
+            crate::server::Peer::convert_poll_message(pseudo, fields, reps, stream_id)
                 .map(PollMessage::Server)
         } else {
-            crate::client::Peer::convert_poll_message(pseudo, fields, stream_id)
+            crate::client::Peer::convert_poll_message(pseudo, fields, reps, stream_id)
                 .map(PollMessage::Client)
         }
     }

@@ -105,6 +105,14 @@ impl<T, B> Codec<T, B> {
         self.inner.set_max_header_list_size(val);
     }
 
+    /// Enable selective header decoding/encoding on both directions (see
+    /// `hpack::selective`). Must be called before any header block is
+    /// processed.
+    pub fn set_selective(&mut self, needed: crate::hpack::NeededSet) {
+        self.inner.set_selective(needed.clone());
+        self.framed_write().set_selective(needed);
+    }
+
     /// Get a reference to the inner stream.
     #[cfg(feature = "unstable")]
     pub fn get_ref(&self) -> &T {

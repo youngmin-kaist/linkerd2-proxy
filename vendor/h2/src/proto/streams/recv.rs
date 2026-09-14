@@ -232,7 +232,7 @@ impl Recv {
         }
 
         let stream_id = frame.stream_id();
-        let (pseudo, fields) = frame.into_parts();
+        let (pseudo, fields, reps) = frame.into_parts_reps();
 
         if pseudo.protocol.is_some()
             && counts.peer().is_server()
@@ -250,7 +250,7 @@ impl Recv {
         if !pseudo.is_informational() {
             let message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, reps, stream_id)?;
 
             // Push the frame onto the stream's recv buffer
             stream
@@ -270,7 +270,7 @@ impl Recv {
             // Convert to response and store it for polling
             let message = counts
                 .peer()
-                .convert_poll_message(pseudo, fields, stream_id)?;
+                .convert_poll_message(pseudo, fields, reps, stream_id)?;
 
             tracing::trace!("Received informational response: stream_id={:?}", stream_id);
 
@@ -420,6 +420,13 @@ impl Recv {
             return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
+        // Selective mode: trailers cannot carry representations (no
+        // extensions on a `HeaderMap`), so decode the rest of them here.
+        let mut frame = frame;
+        if let Err(e) = frame.materialize_all() {
+            proto_err!(conn: "recv_trailers: cannot materialize trailers; err={:?}", e);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
@@ -822,7 +829,7 @@ impl Recv {
 
         let promised_id = frame.promised_id();
         let (pseudo, fields) = frame.into_parts();
-        let req = crate::server::Peer::convert_poll_message(pseudo, fields, promised_id)?;
+        let req = crate::server::Peer::convert_poll_message(pseudo, fields, None, promised_id)?;
 
         if let Err(e) = frame::PushPromise::validate_request(&req) {
             use PushPromiseHeaderError::*;

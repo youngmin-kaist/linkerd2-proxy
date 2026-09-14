@@ -389,6 +389,17 @@ where
         self
     }
 
+    /// Enables selective HPACK decoding (see `h2::selective`).
+    ///
+    /// Requests carrying `h2::selective::RawHeaderReps` in their extensions
+    /// are re-indexed on send instead of re-encoded; responses then carry only
+    /// pseudo-headers and the `needed` names in their `HeaderMap`, with the
+    /// raw representations in the response extensions. Default: off.
+    pub fn selective_headers(&mut self, needed: h2::selective::NeededSet) -> &mut Self {
+        self.h2_builder.selective_headers = Some(needed);
+        self
+    }
+
     /// Sets the header table size.
     ///
     /// This setting informs the peer of the maximum size of the header compression

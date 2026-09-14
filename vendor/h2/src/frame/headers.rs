@@ -1,7 +1,10 @@
 use super::{util, StreamDependency, StreamId};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
-use crate::hpack::{self, BytesStr};
+use crate::hpack::mirror::Kind as HKind;
+use crate::hpack::selective::{NeededSet, RawHeaderReps, SelectiveDecoder, SelectiveEncoder, TAG_FORBIDDEN};
+use crate::hpack::transcode::{self as transcode, Sink};
+use crate::hpack::{self, BytesStr, DecoderError, NeedMore};
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
@@ -97,6 +100,17 @@ struct HeaderBlock {
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    /// Selective mode: the raw representations of the block (received: all of
+    /// them, with `fields` sparse; to send: attached by the peer conversion).
+    reps: Option<RawHeaderReps>,
+
+    /// Selective mode: a regular (non-pseudo) field has been seen.
+    seen_regular: bool,
+
+    /// Selective mode: parse position in `reps.buf.bytes` (for blocks split
+    /// across CONTINUATION frames).
+    sel_pos: usize,
 }
 
 #[derive(Debug)]
@@ -123,6 +137,9 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo,
+                reps: None,
+                seen_regular: false,
+                sel_pos: 0,
             },
             flags: HeadersFlag::default(),
         }
@@ -140,6 +157,9 @@ impl Headers {
                 fields,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                reps: None,
+                seen_regular: false,
+                sel_pos: 0,
             },
             flags,
         }
@@ -205,6 +225,9 @@ impl Headers {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                reps: None,
+                seen_regular: false,
+                sel_pos: 0,
             },
             flags,
         };
@@ -245,8 +268,39 @@ impl Headers {
         self.header_block.is_over_size
     }
 
+    #[allow(dead_code)]
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
         (self.header_block.pseudo, self.header_block.fields)
+    }
+
+    /// Like `into_parts`, also yielding the selective-mode representations.
+    pub fn into_parts_reps(self) -> (Pseudo, HeaderMap, Option<RawHeaderReps>) {
+        (
+            self.header_block.pseudo,
+            self.header_block.fields,
+            self.header_block.reps,
+        )
+    }
+
+    /// Attach representations to be re-indexed when this frame is encoded
+    /// by a selective encoder.
+    pub fn set_reps(&mut self, reps: RawHeaderReps) {
+        self.header_block.reps = Some(reps);
+    }
+
+    #[allow(dead_code)]
+    pub fn take_reps(&mut self) -> Option<RawHeaderReps> {
+        self.header_block.reps.take()
+    }
+
+    /// Selective mode, trailers: decode the representations that were not
+    /// materialized into `fields` (trailers cannot carry extensions).
+    pub fn materialize_all(&mut self) -> Result<(), Error> {
+        if let Some(reps) = self.header_block.reps.take() {
+            reps.materialize_rest(&mut self.header_block.fields)
+                .map_err(Error::Hpack)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "unstable")]
@@ -365,6 +419,9 @@ impl PushPromise {
                 fields,
                 is_over_size: false,
                 pseudo,
+                reps: None,
+                seen_regular: false,
+                sel_pos: 0,
             },
             promised_id,
             stream_id,
@@ -456,6 +513,9 @@ impl PushPromise {
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                reps: None,
+                seen_regular: false,
+                sel_pos: 0,
             },
             promised_id,
             stream_id: head.stream_id(),
@@ -850,6 +910,9 @@ impl HeaderBlock {
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
+        if let Some(sel) = decoder.selective_mut() {
+            return self.load_selective(src, max_header_list_size, sel);
+        }
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;
         let mut headers_size = self.calculate_header_list_size();
@@ -940,7 +1003,148 @@ impl HeaderBlock {
         Ok(())
     }
 
+    /// Selective mode: walk the block with the mirror, materialize
+    /// pseudo-headers and needed names into `fields`, keep every
+    /// representation in `reps`. Nothing else touches the map.
+    fn load_selective(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        sel: &mut SelectiveDecoder,
+    ) -> Result<(), Error> {
+        let mut malformed = false;
+        let mut headers_size = self.field_size; // selective: pseudo included
+        if self.reps.is_none() {
+            self.reps = Some(RawHeaderReps {
+                buf: sel.pool.take(),
+                mirror_tid: sel.mirror.tid(),
+                names_materialized: 0,
+                needed: sel.needed.clone(),
+            });
+        }
+        let reps = self.reps.as_mut().expect("reps");
+        // Append this fragment to the rep buffer; parsing resumes where the
+        // previous fragment stopped.
+        sel.stats.in_bytes += src.len() as u64;
+        let end = reps.buf.push_block(&src[..]) + src.len();
+        src.clear();
+        let mut i = self.sel_pos;
+
+        while i < end {
+            let start = i;
+            let n = reps.buf.reps.len();
+            match transcode::parse_one(&mut reps.buf, end, &mut i, &mut sel.mirror, None, &mut sel.stats) {
+                Ok(()) => {}
+                Err(transcode::Error::Truncated) => {
+                    // Representation split across CONTINUATION frames.
+                    self.sel_pos = start;
+                    return Err(Error::Hpack(DecoderError::NeedMore(
+                        NeedMore::UnexpectedEndOfStream,
+                    )));
+                }
+                Err(e) => return Err(Error::Hpack(DecoderError::Selective(e))),
+            }
+            let rep = reps.buf.reps[n];
+            if rep.is_size_update() {
+                continue;
+            }
+            headers_size += rep.decoded_size();
+            let over = headers_size >= max_header_list_size;
+            if over && !self.is_over_size {
+                tracing::trace!("load_hpack; header list size over max");
+                self.is_over_size = true;
+            }
+            if rep.is_pseudo() {
+                if self.seen_regular {
+                    tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
+                    malformed = true;
+                } else if !over {
+                    let value = sel.share(rep.dec(&reps.buf.bytes).unwrap_or(&[]));
+                    let header = hpack::Header::new(Bytes::from_static(rep.hkind.pseudo_name()), value)
+                        .map_err(Error::Hpack)?;
+                    macro_rules! set_pseudo {
+                        ($field:ident, $val:expr) => {{
+                            if self.pseudo.$field.is_some() {
+                                tracing::trace!("load_hpack; header malformed -- repeated pseudo");
+                                malformed = true;
+                            } else {
+                                self.pseudo.$field = Some($val);
+                            }
+                        }};
+                    }
+                    match header {
+                        hpack::Header::Authority(v) => set_pseudo!(authority, v),
+                        hpack::Header::Method(v) => set_pseudo!(method, v),
+                        hpack::Header::Scheme(v) => set_pseudo!(scheme, v),
+                        hpack::Header::Path(v) => set_pseudo!(path, v),
+                        hpack::Header::Protocol(v) => set_pseudo!(protocol, v),
+                        hpack::Header::Status(v) => set_pseudo!(status, v),
+                        hpack::Header::Field { .. } => unreachable!("pseudo kind"),
+                    }
+                }
+            } else {
+                self.seen_regular = true;
+                if rep.tag == TAG_FORBIDDEN {
+                    tracing::trace!("load_hpack; connection level header");
+                    malformed = true;
+                } else if let Some(ix) = NeededSet::needed_index(rep.tag) {
+                    let name = sel.needed.names()[ix].clone();
+                    let value = rep.dec(&reps.buf.bytes).unwrap_or(&[]);
+                    if name == header::TE && value != b"trailers" {
+                        tracing::trace!("load_hpack; TE header not set to trailers");
+                        malformed = true;
+                    } else if !over {
+                        let value = HeaderValue::from_maybe_shared(sel.share(value))
+                            .map_err(|e| Error::Hpack(DecoderError::from(e)))?;
+                        self.field_size += rep.decoded_size();
+                        self.fields.append(name, value);
+                        reps.names_materialized |= 1u64 << ix;
+                    }
+                }
+            }
+        }
+        self.sel_pos = end;
+        sel.block_done();
+
+        if malformed {
+            tracing::trace!("malformed message");
+            return Err(Error::MalformedMessage);
+        }
+        Ok(())
+    }
+
+    /// Selective mode: re-index the representations (if any) against the
+    /// encoder table; fields the stack added are appended.
+    fn into_encoding_selective(self, sel: &mut SelectiveEncoder) -> EncodingHeaderBlock {
+        let mut hpack = BytesMut::with_capacity(256);
+        {
+            let mut sink = Sink::new(&mut hpack);
+            transcode::emit_pending_resize(&mut sel.table, &mut sink);
+            let HeaderBlock { fields, pseudo, reps, .. } = self;
+            match reps {
+                Some(reps) => {
+                    encode_with_reps(sel, &mut sink, &pseudo, &fields, &reps);
+                    sel.pool.put(reps.buf);
+                }
+                None => {
+                    flush_pseudo(sel, &pseudo, 0, &mut sink);
+                    for (name, value) in fields.iter() {
+                        sel.emit_extra(&mut sink, name.as_str().as_bytes(), value.as_bytes(), value.is_sensitive());
+                    }
+                }
+            }
+            sel.stats.out_bytes += sink.n as u64;
+        }
+        sel.block_done();
+        EncodingHeaderBlock {
+            hpack: hpack.freeze(),
+        }
+    }
+
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
+        if let Some(sel) = encoder.selective_mut() {
+            return self.into_encoding_selective(sel);
+        }
         let mut hpack = BytesMut::new();
         let headers = Iter {
             pseudo: Some(self.pseudo),
@@ -981,6 +1185,142 @@ impl HeaderBlock {
     }
 }
 
+/// The message's value for a pseudo kind, as bytes.
+fn pseudo_value(pseudo: &Pseudo, kind: HKind) -> Option<&[u8]> {
+    match kind {
+        HKind::Method => pseudo.method.as_ref().map(|m| m.as_str().as_bytes()),
+        HKind::Scheme => pseudo.scheme.as_ref().map(|s| s.as_ref()),
+        HKind::Authority => pseudo.authority.as_ref().map(|s| s.as_ref()),
+        HKind::Path => pseudo.path.as_ref().map(|s| s.as_ref()),
+        HKind::Protocol => pseudo.protocol.as_ref().map(|p| p.as_str().as_bytes()),
+        HKind::Status => pseudo.status.as_ref().map(|s| s.as_str().as_bytes()),
+        HKind::None => None,
+    }
+}
+
+const PSEUDO_ORDER: [HKind; 6] = [
+    HKind::Method,
+    HKind::Scheme,
+    HKind::Authority,
+    HKind::Path,
+    HKind::Protocol,
+    HKind::Status,
+];
+
+/// Emit every pseudo-header of `pseudo` not in `done`.
+fn flush_pseudo<B: BufMut>(sel: &mut SelectiveEncoder, pseudo: &Pseudo, done: u8, sink: &mut Sink<'_, B>) {
+    for kind in PSEUDO_ORDER {
+        if done & kind.bit() != 0 {
+            continue;
+        }
+        if let Some(v) = pseudo_value(pseudo, kind) {
+            sel.emit_extra(sink, kind.pseudo_name(), v, false);
+        }
+    }
+}
+
+/// Selective encode with representations. Default: the sparse `fields` map
+/// and `pseudo` are authoritative for pseudo-headers and materialized names,
+/// the representations for everything else. `trust_reps`: representations
+/// are emitted as is; only pseudo-headers they lack and map fields whose
+/// names were not materialized are added (see `hpack::selective` docs).
+fn encode_with_reps<B: BufMut>(
+    sel: &mut SelectiveEncoder,
+    sink: &mut Sink<'_, B>,
+    pseudo: &Pseudo,
+    fields: &HeaderMap,
+    reps: &RawHeaderReps,
+) {
+    let trust = sel.needed.trust_reps();
+    let needed = &reps.needed;
+    let bytes: &[u8] = &reps.buf.bytes;
+    let mirror_tid = reps.mirror_tid;
+    // Lazily built; empty `Vec` never allocates.
+    let mut cursors: Vec<Option<std::iter::Peekable<header::ValueIter<'_, HeaderValue>>>> =
+        Vec::new();
+    let mut pseudo_done: u8 = 0;
+    let mut pseudo_flushed = false;
+    let mut rewrites = 0u64;
+
+    for rep in &reps.buf.reps {
+        if rep.is_size_update() {
+            continue;
+        }
+        if rep.is_pseudo() {
+            let bit = rep.hkind.bit();
+            let keep = if trust {
+                pseudo_done & bit == 0 && !pseudo_flushed
+            } else {
+                let same = match (pseudo_value(pseudo, rep.hkind), rep.dec(bytes)) {
+                    (Some(want), Some(have)) => want == have,
+                    _ => false,
+                };
+                same && pseudo_done & bit == 0 && !pseudo_flushed
+            };
+            if keep {
+                transcode::emit_one(rep, bytes, mirror_tid, &mut sel.table, sink, &mut sel.stats);
+                pseudo_done |= bit;
+            } else {
+                rewrites += 1;
+            }
+            continue;
+        }
+        if !pseudo_flushed {
+            flush_pseudo(sel, pseudo, pseudo_done, sink);
+            pseudo_flushed = true;
+        }
+        if !trust && reps.is_materialized(rep.tag) {
+            let ix = NeededSet::needed_index(rep.tag).expect("materialized => needed");
+            if cursors.len() <= ix {
+                cursors.resize_with(ix + 1, || None);
+            }
+            let cur = cursors[ix].get_or_insert_with(|| {
+                fields
+                    .get_all(needed.name_of_tag(rep.tag).expect("needed"))
+                    .iter()
+                    .peekable()
+            });
+            let same = match (cur.peek(), rep.dec(bytes)) {
+                (Some(want), Some(have)) => want.as_bytes() == have,
+                _ => false,
+            };
+            if same {
+                cur.next();
+                transcode::emit_one(rep, bytes, mirror_tid, &mut sel.table, sink, &mut sel.stats);
+            } else {
+                rewrites += 1;
+            }
+            continue;
+        }
+        transcode::emit_one(rep, bytes, mirror_tid, &mut sel.table, sink, &mut sel.stats);
+    }
+    if !pseudo_flushed {
+        flush_pseudo(sel, pseudo, pseudo_done, sink);
+    }
+    // Materialized names: values the representations did not cover.
+    for (ix, cur) in cursors.iter_mut().enumerate() {
+        if let Some(cur) = cur {
+            let name = &needed.names()[ix];
+            for value in cur {
+                sel.emit_extra(sink, name.as_str().as_bytes(), value.as_bytes(), value.is_sensitive());
+                rewrites += 1;
+            }
+        }
+    }
+    // Everything else in the map came from the stack.
+    for (name, value) in fields.iter() {
+        let tag = needed.tag_of(name.as_str().as_bytes());
+        if reps.is_materialized(tag) {
+            continue;
+        }
+        sel.emit_extra(sink, name.as_str().as_bytes(), value.as_bytes(), value.is_sensitive());
+    }
+    if rewrites > 0 {
+        sel.stats.rewrites += 1;
+        tracing::trace!(rewrites, "selective encode: sparse map differed from representations");
+    }
+}
+
 fn calculate_headermap_size(map: &HeaderMap) -> usize {
     map.iter()
         .map(|(name, value)| decoded_header_size(name.as_str().len(), value.len()))
@@ -996,6 +1336,66 @@ mod test {
     use super::*;
     use crate::frame;
     use crate::hpack::{huffman, Encoder};
+
+    /// stock encode → selective load → selective encode (with reps) → stock decode
+    #[test]
+    fn selective_load_then_encode_round_trip() {
+        use crate::hpack::selective::NeededSet;
+        use http::header::HeaderName;
+        let needed = NeededSet::new(["content-type", "te"].iter().map(|s| HeaderName::from_static(s)));
+        let mut client = Encoder::default();
+        let mut sdec = hpack::Decoder::default();
+        sdec.set_selective(needed.clone());
+        let mut senc = Encoder::default();
+        senc.set_selective(needed.clone());
+        let mut backend = hpack::Decoder::default();
+
+        for r in 0..3 {
+            let mut fields = HeaderMap::new();
+            fields.insert("content-type", HeaderValue::from_static("application/grpc"));
+            fields.insert("user-agent", HeaderValue::from_static("grpc-go/1.71.0"));
+            fields.insert("te", HeaderValue::from_static("trailers"));
+            fields.insert("x-client", HeaderValue::from_static("0"));
+            fields.insert("uber-trace-id", HeaderValue::from_str(&format!("t{}", r)).unwrap());
+            let pseudo = Pseudo::request(Method::POST, "http://backend.test/ok".parse().unwrap(), None);
+            let frame = Headers::new(StreamId::from(1), pseudo, fields);
+            let mut buf = BytesMut::new();
+            {
+                let mut dst = (&mut buf).limit(1 << 16);
+                assert!(frame.encode(&mut client, &mut dst).is_none());
+            }
+            let head = Head::parse(&buf);
+            let mut payload = buf.split_off(frame::HEADER_LEN);
+            let (mut loaded, mut payload2) = Headers::load(head, payload.split()).unwrap();
+            let _ = &mut payload;
+            loaded.load_hpack(&mut payload2, 16 << 20, &mut sdec).unwrap();
+            let (pseudo, fields, reps) = loaded.into_parts_reps();
+            let reps = reps.expect("reps");
+            println!("r={} sparse fields={:?} reps={}", r, fields, reps.len());
+            assert_eq!(fields.len(), 2, "sparse: content-type + te");
+            assert!(reps.len() >= 8, "{:?}", reps);
+
+            let mut out = Headers::new(StreamId::from(3), pseudo, fields);
+            out.set_reps(reps);
+            let mut wire = BytesMut::new();
+            {
+                let mut dst = (&mut wire).limit(1 << 16);
+                assert!(out.encode(&mut senc, &mut dst).is_none());
+            }
+            let head = Head::parse(&wire);
+            let mut payload = wire.split_off(frame::HEADER_LEN);
+            let (mut got, mut payload2) = Headers::load(head, payload.split()).unwrap();
+            let _ = &mut payload;
+            got.load_hpack(&mut payload2, 16 << 20, &mut backend).unwrap();
+            let (pseudo, fields) = got.into_parts();
+            println!("r={} backend pseudo={:?} fields={:?}", r, pseudo, fields);
+            assert_eq!(pseudo.method, Some(Method::POST));
+            assert_eq!(pseudo.path.as_deref(), Some("/ok"));
+            assert_eq!(fields.len(), 5, "{:?}", fields);
+            assert_eq!(fields["x-client"], "0");
+            assert_eq!(fields["uber-trace-id"], format!("t{}", r).as_str());
+        }
+    }
 
     #[test]
     fn test_nameless_header_at_resume() {

@@ -78,6 +78,7 @@ pub(crate) struct Config {
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_concurrent_streams: Option<u32>,
     pub(crate) reset_stream_duration: Option<Duration>,
+    pub(crate) selective_headers: Option<h2::selective::NeededSet>,
 }
 
 impl Default for Config {
@@ -99,6 +100,7 @@ impl Default for Config {
             header_table_size: None,
             max_concurrent_streams: None,
             reset_stream_duration: None,
+            selective_headers: None,
         }
     }
 }
@@ -130,6 +132,9 @@ fn new_builder(config: &Config) -> Builder {
     }
     if let Some(dur) = config.reset_stream_duration {
         builder.reset_stream_duration(dur);
+    }
+    if let Some(needed) = &config.selective_headers {
+        builder.selective_headers(needed.clone());
     }
     builder
 }

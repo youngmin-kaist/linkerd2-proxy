@@ -12,6 +12,7 @@ pub mod h2;
 mod header_from_target;
 pub mod normalize_uri;
 pub mod orig_proto;
+pub mod selective_h2;
 mod server;
 pub mod strip_header;
 pub mod timeout;

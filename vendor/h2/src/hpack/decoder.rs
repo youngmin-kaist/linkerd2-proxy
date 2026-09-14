@@ -1,3 +1,5 @@
+use super::selective::{NeededSet, SelectiveDecoder};
+use super::transcode::TranscodeStats;
 use super::{header::BytesStr, huffman, Header};
 use crate::frame;
 
@@ -19,6 +21,9 @@ pub struct Decoder {
     last_max_update: usize,
     table: Table,
     buffer: BytesMut,
+    /// Selective mode: mirror of the peer's encoder table instead of a
+    /// decoded table (see `hpack::selective`).
+    selective: Option<SelectiveDecoder>,
 }
 
 /// Represents all errors that can be encountered while performing the decoding
@@ -35,6 +40,9 @@ pub enum DecoderError {
     InvalidMaxDynamicSize,
     IntegerOverflow,
     NeedMore(NeedMore),
+    /// Selective mode: the mirror walk found the block malformed. Mapped to
+    /// `COMPRESSION_ERROR` by the codec.
+    Selective(super::transcode::Error),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -158,12 +166,39 @@ impl Decoder {
             last_max_update: size,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
+            selective: None,
         }
+    }
+
+    /// Switch this decoder to selective mode (see `hpack::selective`). Must
+    /// be called before the first block is decoded.
+    pub fn set_selective(&mut self, needed: NeededSet) {
+        self.selective = Some(SelectiveDecoder::new(needed, self.last_max_update));
+    }
+
+    /// Whether selective mode is on.
+    #[allow(dead_code)]
+    pub fn is_selective(&self) -> bool {
+        self.selective.is_some()
+    }
+
+    pub(crate) fn selective_mut(&mut self) -> Option<&mut SelectiveDecoder> {
+        self.selective.as_mut()
+    }
+
+    /// Transcode statistics of this connection so far (selective mode).
+    #[allow(dead_code)]
+    pub fn selective_stats(&self) -> Option<TranscodeStats> {
+        self.selective.as_ref().map(|s| s.stats)
     }
 
     /// Queues a potential size update
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
+        if self.selective.is_some() {
+            // The mirror follows the peer's in-band size updates.
+            return;
+        }
         let size = match self.max_size_update {
             Some(v) => cmp::max(v, size),
             None => size,

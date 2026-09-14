@@ -50,6 +50,7 @@ features = ["stream"]
 [features]
 stream = []
 unstable = []
+unstable-hpack = []
 
 [lib]
 name = "h2"
@@ -71,6 +72,10 @@ path = "examples/server.rs"
 name = "main"
 path = "benches/main.rs"
 harness = false
+
+[[test]]
+name = "selective"
+path = "tests/selective.rs"
 
 [dependencies.atomic-waker]
 version = "1.0.0"

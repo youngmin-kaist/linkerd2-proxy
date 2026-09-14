@@ -108,7 +108,15 @@ macro_rules! ready {
 #[cfg_attr(feature = "unstable", allow(missing_docs))]
 mod codec;
 mod error;
+
+#[cfg(not(feature = "unstable-hpack"))]
 mod hpack;
+
+/// HPACK codec, including the re-indexing transcoder (`hpack::transcode`).
+/// Exposed for tests/benches only; no stability guarantees.
+#[cfg(feature = "unstable-hpack")]
+#[allow(missing_docs, missing_debug_implementations)]
+pub mod hpack;
 
 #[cfg(not(feature = "unstable"))]
 mod proto;
@@ -128,6 +136,15 @@ pub mod client;
 pub mod ext;
 pub mod server;
 mod share;
+
+/// Selective header decoding: sparse `HeaderMap` + raw HPACK representations
+/// re-indexed on send instead of decode→re-encode. See
+/// [`client::Builder::selective_headers`] / [`server::Builder::selective_headers`].
+pub mod selective {
+    pub use crate::hpack::mirror::Kind;
+    pub use crate::hpack::selective::{NeededSet, RawHeaderReps, MAX_NEEDED};
+    pub use crate::hpack::transcode::{Rep, RepBuf, RepKind, TranscodeStats};
+}
 
 #[cfg(fuzzing)]
 #[cfg_attr(feature = "unstable", allow(missing_docs))]

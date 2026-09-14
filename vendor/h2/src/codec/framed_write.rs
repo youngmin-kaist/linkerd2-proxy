@@ -332,6 +332,11 @@ impl<T, B> FramedWrite<T, B> {
         self.encoder.hpack.update_max_size(val);
     }
 
+    /// Selective header encoding (see `hpack::selective`).
+    pub fn set_selective(&mut self, needed: hpack::NeededSet) {
+        self.encoder.hpack.set_selective(needed);
+    }
+
     /// Retrieve the last data frame that has been sent
     pub fn take_last_data_frame(&mut self) -> Option<frame::Data<B>> {
         self.encoder.last_data_frame.take()

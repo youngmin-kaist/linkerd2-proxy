@@ -116,6 +116,9 @@ where
                 }
 
                 builder.max_frame_size(max_frame_size);
+                if let Some(needed) = crate::selective_h2::needed_set() {
+                    builder.selective_headers(needed.clone());
+                }
                 if let Some(max) = max_concurrent_reset_streams {
                     builder.max_concurrent_reset_streams(max);
                 }

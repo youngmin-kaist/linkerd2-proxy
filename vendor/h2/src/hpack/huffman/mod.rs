@@ -40,6 +40,33 @@ pub fn decode(src: &[u8], buf: &mut BytesMut) -> Result<BytesMut, DecoderError> 
     Ok(buf.split())
 }
 
+/// Count-only Huffman walk: returns the decoded length of `src` without
+/// producing any bytes. Same FSM and the same validity rules as [`decode`]
+/// (EOS inside the string or invalid padding is an error).
+///
+/// Used by the re-indexing transcoder (`hpack::transcode`) for exact RFC 7541
+/// §4.1 entry-size accounting of values it never needs to decode.
+pub fn decoded_len(src: &[u8]) -> Result<usize, DecoderError> {
+    let mut decoder = Decoder::new();
+    let mut n = 0usize;
+
+    for b in src {
+        if decoder.decode4(b >> 4)?.is_some() {
+            n += 1;
+        }
+
+        if decoder.decode4(b & 0xf)?.is_some() {
+            n += 1;
+        }
+    }
+
+    if !decoder.is_final() {
+        return Err(DecoderError::InvalidHuffmanCode);
+    }
+
+    Ok(n)
+}
+
 pub fn encode(src: &[u8], dst: &mut BytesMut) {
     let mut bits: u64 = 0;
     let mut bits_left = 40;

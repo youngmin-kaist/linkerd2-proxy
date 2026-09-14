@@ -227,7 +227,12 @@ where
         let protocol = request.extensions_mut().remove::<Protocol>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
+        // Selective mode: the raw header representations must survive.
+        let reps = request.extensions_mut().remove::<crate::hpack::RawHeaderReps>();
         request.extensions_mut().clear();
+        if let Some(reps) = reps {
+            request.extensions_mut().insert(reps);
+        }
 
         // TODO: There is a hazard with assigning a stream ID before the
         // prioritize layer. If prioritization reorders new streams, this
@@ -1201,7 +1206,12 @@ impl<B> StreamRef<B> {
         end_of_stream: bool,
     ) -> Result<(), UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
+        // Selective mode: the raw header representations must survive.
+        let reps = response.extensions_mut().remove::<crate::hpack::RawHeaderReps>();
         response.extensions_mut().clear();
+        if let Some(reps) = reps {
+            response.extensions_mut().insert(reps);
+        }
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
