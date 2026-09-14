@@ -77,6 +77,18 @@ where
             let local = Local(ClientAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
             return Box::pin(future::ready(Ok((io::EitherIo::Right(dio), local))));
         }
+        // A DMA backend that was published and is now gone: the provider
+        // process died. Refuse immediately - the same signal a dead TCP
+        // backend gives - so the caller's gRPC fails the RPC fast and its
+        // round-robin moves to a live replica. Falling through would TCP-dial
+        // the non-routable DMA key and hang until timeout, wedging the edge.
+        if dmesh_doca::backend::was_published(&addr) {
+            tracing::warn!(server.addr = %addr, "dmesh DMA backend gone; refusing instead of TCP fallback");
+            return Box::pin(future::ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "dmesh DMA backend unavailable",
+            ))));
+        }
         let fut = self.0.call(ep);
         Box::pin(async move {
             let (tcp, local) = fut.await?;

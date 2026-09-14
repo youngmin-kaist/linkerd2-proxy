@@ -121,6 +121,9 @@ pub async fn serve<N>(
     N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + 'static,
 {
     tokio::pin!(shutdown);
+    // slot -> published backend address, so ConnClosed can unpublish it.
+    let mut backend_slots: std::collections::HashMap<usize, SocketAddr> =
+        std::collections::HashMap::new();
     loop {
         let ev = tokio::select! {
             _ = &mut shutdown => return,
@@ -131,6 +134,16 @@ pub async fn serve<N>(
         };
 
         match ev {
+            // A backend slot was torn down (its host process died or
+            // disconnected): evict its not-yet-taken channel from the
+            // registry so the connector refuses instead of handing out a
+            // dead channel. Non-backend slots have nothing registered.
+            DmeshEvent::ConnClosed(slot) | DmeshEvent::ConnError(slot) => {
+                if let Some(addr) = backend_slots.remove(&slot) {
+                    dmesh_doca::backend::unpublish(slot, &addr);
+                }
+                continue;
+            }
             DmeshEvent::ConnReady(slot, flow) => {
                 let peer = SocketAddr::V4(flow.src);
                 let (io, handle) = dmesh_io_pair(peer);
@@ -148,7 +161,8 @@ pub async fn serve<N>(
                 if flow.is_backend {
                     let addr = SocketAddr::V4(flow.dst);
                     info!(slot, %addr, "dmesh backend channel ready");
-                    dmesh_doca::backend::publish(addr, io);
+                    backend_slots.insert(slot, addr);
+                    dmesh_doca::backend::publish(slot, addr, io);
                     continue;
                 }
 

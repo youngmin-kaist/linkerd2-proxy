@@ -20,26 +20,61 @@ pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
 pub mod backend {
     use crate::DmeshIo;
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         net::SocketAddr,
         sync::{Mutex, OnceLock},
     };
 
-    fn reg() -> &'static Mutex<HashMap<SocketAddr, Vec<DmeshIo>>> {
-        static R: OnceLock<Mutex<HashMap<SocketAddr, Vec<DmeshIo>>>> = OnceLock::new();
+    /// Published-but-not-yet-taken backend channels, tagged with the driver
+    /// slot that owns them so a slot teardown can evict exactly its entry.
+    fn reg() -> &'static Mutex<HashMap<SocketAddr, Vec<(usize, DmeshIo)>>> {
+        static R: OnceLock<Mutex<HashMap<SocketAddr, Vec<(usize, DmeshIo)>>>> = OnceLock::new();
         R.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Every address that has ever had a DMA backend published. A lookup
+    /// miss on one of these means the backend process went away (crashed or
+    /// exited); the connector must refuse it rather than fall through to a
+    /// TCP dial of a non-routable DMA key, which hangs until timeout and
+    /// wedges every client edge that round-robins onto that replica.
+    fn seen() -> &'static Mutex<HashSet<SocketAddr>> {
+        static S: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(HashSet::new()))
     }
 
     /// Multiple channels may serve one address (one per DPU worker in
     /// N-driver mode); each is handed out once, in LIFO order.
-    pub fn publish(addr: SocketAddr, io: DmeshIo) {
-        tracing::info!(%addr, "dmesh backend channel published");
-        reg().lock().unwrap().entry(addr).or_default().push(io);
+    pub fn publish(slot: usize, addr: SocketAddr, io: DmeshIo) {
+        tracing::info!(slot, %addr, "dmesh backend channel published");
+        seen().lock().unwrap().insert(addr);
+        reg().lock().unwrap().entry(addr).or_default().push((slot, io));
+    }
+
+    /// The backend in `slot` went away (host process died / disconnected).
+    /// Drop its channel if the connector never took it, so a later `take`
+    /// cannot hand out a dead channel that would hang every request on it.
+    /// Channels already taken are owned by the h2 pool, which sees EOF from
+    /// the driver's rx/tx teardown and evicts them itself.
+    pub fn unpublish(slot: usize, addr: &SocketAddr) {
+        let mut reg = reg().lock().unwrap();
+        if let Some(v) = reg.get_mut(addr) {
+            let before = v.len();
+            v.retain(|(s, _)| *s != slot);
+            if v.len() != before {
+                tracing::warn!(slot, %addr, "dmesh backend channel unpublished (backend gone)");
+            }
+        }
+    }
+
+    /// True if a DMA backend was ever published for `addr`, even if none is
+    /// available right now.
+    pub fn was_published(addr: &SocketAddr) -> bool {
+        seen().lock().unwrap().contains(addr)
     }
 
     pub fn take(addr: &SocketAddr) -> Option<DmeshIo> {
         let mut reg = reg().lock().unwrap();
-        let io = reg.get_mut(addr).and_then(|v| v.pop());
+        let io = reg.get_mut(addr).and_then(|v| v.pop()).map(|(_, io)| io);
         if io.is_some() {
             tracing::info!(%addr, "dmesh backend channel taken by connector");
         }
