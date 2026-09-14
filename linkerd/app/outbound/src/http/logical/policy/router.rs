@@ -38,7 +38,7 @@ where
 {
     pub(super) parent: T,
     pub(super) addr: Addr,
-    pub(super) routes: Arc<[http_route::Route<M, route::Route<T, F, E>>]>,
+    pub(super) routes: Arc<[http_route::Route<M, Arc<route::Route<T, F, E>>>]>,
     pub(super) backends: distribute::Backends<Concrete<T>>,
 }
 
@@ -230,7 +230,7 @@ where
                   }| {
                 let route_ref = RouteRef(meta);
                 let distribution = mk_distribution(&route_ref, &distribution);
-                route::Route {
+                Arc::new(route::Route {
                     addr: addr.clone(),
                     parent: parent.clone(),
                     parent_ref: parent_ref.clone(),
@@ -238,7 +238,7 @@ where
                     filters,
                     distribution,
                     params,
-                }
+                })
             }
         };
 

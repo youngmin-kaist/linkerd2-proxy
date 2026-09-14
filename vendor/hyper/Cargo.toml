@@ -94,6 +94,7 @@ http1 = [
 http2 = [
     "dep:futures-channel",
     "dep:futures-core",
+    "dep:futures-util",
     "dep:h2",
 ]
 nightly = []

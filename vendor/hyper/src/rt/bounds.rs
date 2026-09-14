@@ -97,6 +97,8 @@ mod h2_server {
     use crate::{proto::h2::server::H2Stream, rt::Executor};
     use http_body::Body;
     use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     /// An executor to spawn http2 connections.
     ///
@@ -111,6 +113,13 @@ mod h2_server {
     {
         #[doc(hidden)]
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, Self>);
+
+        /// Polls a stream future in place (used when the connection drives
+        /// its streams inline instead of spawning them; see
+        /// `server::conn::http2::Builder::inline_streams`). Lives on the
+        /// executor trait so the `H2Stream: Future` bound stays sealed here.
+        #[doc(hidden)]
+        fn poll_h2stream(fut: Pin<&mut H2Stream<F, B, Self>>, cx: &mut Context<'_>) -> Poll<()>;
     }
 
     #[doc(hidden)]
@@ -124,6 +133,10 @@ mod h2_server {
     {
         fn execute_h2stream(&mut self, fut: H2Stream<F, B, E>) {
             self.execute(fut)
+        }
+
+        fn poll_h2stream(fut: Pin<&mut H2Stream<F, B, E>>, cx: &mut Context<'_>) -> Poll<()> {
+            fut.poll(cx)
         }
     }
 

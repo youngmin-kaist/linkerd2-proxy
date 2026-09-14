@@ -280,6 +280,47 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Enables selective HPACK decoding (see `h2::selective`).
+    ///
+    /// Requests then carry only pseudo-headers and the `needed` names in
+    /// their `HeaderMap`; the raw representations are attached to the request
+    /// extensions as `h2::selective::RawHeaderReps`, and responses carrying a
+    /// `RawHeaderReps` are re-indexed on send. Default: off.
+    pub fn selective_headers(&mut self, needed: h2::selective::NeededSet) -> &mut Self {
+        self.h2_builder.selective_headers = Some(needed);
+        self
+    }
+
+    /// Drive stream (request/response) futures inline from the connection
+    /// future instead of spawning one executor task per stream.
+    ///
+    /// Streams are kept in a set owned by the connection and polled after
+    /// the connection's own I/O work; at most `INLINE_STREAM_POLL_CAP` stream
+    /// polls happen per connection poll (the rest are deferred with a
+    /// self-wake so sibling tasks get a turn). Note that a panic in a stream
+    /// then unwinds the connection future rather than a detached task.
+    /// Default: off (spawn per stream).
+    pub fn inline_streams(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.inline_streams = enabled;
+        self
+    }
+
+    /// Inline mode: maximum stream-future polls per poll of the connection
+    /// future (fairness bound; default 1024).
+    pub fn inline_stream_poll_cap(&mut self, cap: usize) -> &mut Self {
+        self.h2_builder.inline_stream_poll_cap = cap.max(1);
+        self
+    }
+
+    /// Inline mode: after inline streams complete, poll the connection
+    /// again in the same connection poll to flush their responses (default
+    /// true). When false, the flush waits for the next wakeup, which
+    /// batches more responses per write.
+    pub fn inline_flush_on_complete(&mut self, enabled: bool) -> &mut Self {
+        self.h2_builder.inline_flush_on_complete = enabled;
+        self
+    }
+
     /// Set the timer used in background tasks.
     pub fn timer<M>(&mut self, timer: M) -> &mut Self
     where

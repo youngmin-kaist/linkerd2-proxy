@@ -5,6 +5,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -60,8 +61,13 @@ pub struct ResponseFuture<W, F> {
 
 /// A [`WrapErr`] that converts inner errors to an `E` via `From<(&T, Error)`,
 /// where `T` is a stack target.
+///
+/// The target is held behind an `Arc`: [`MapErr::call`] clones the wrapper
+/// into every response future, and stack targets (router params, endpoints)
+/// are deep structures whose per-request clone/drop was measurable. The error
+/// only needs `&T`, so sharing is semantically identical.
 pub struct WrapFromTarget<T, E> {
-    target: T,
+    target: Arc<T>,
     _err: PhantomData<fn(E)>,
 }
 
@@ -111,7 +117,7 @@ impl<N> NewMapErr<(), (), N> {
         WrapFromTarget<T, E>: WrapErr<Error> + Clone,
     {
         let extract = |t: &T| WrapFromTarget {
-            target: t.clone(),
+            target: Arc::new(t.clone()),
             _err: PhantomData,
         };
         NewMapErr::layer_with(extract as ExtractWrapFromTarget<T, E>)
@@ -261,7 +267,7 @@ where
     type Error = OutE;
 
     fn wrap_err(&self, error: InE) -> OutE {
-        OutE::from((&self.target, error.into()))
+        OutE::from((&*self.target, error.into()))
     }
 }
 
@@ -273,7 +279,7 @@ impl<T: fmt::Debug, E> fmt::Debug for WrapFromTarget<T, E> {
     }
 }
 
-impl<T: Clone, E> Clone for WrapFromTarget<T, E> {
+impl<T, E> Clone for WrapFromTarget<T, E> {
     fn clone(&self) -> Self {
         Self {
             target: self.target.clone(),

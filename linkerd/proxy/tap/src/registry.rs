@@ -42,6 +42,12 @@ impl Registry {
         self.taps_recv.borrow().clone()
     }
 
+    /// Returns a watch on the registered taps, so callers can keep a local
+    /// snapshot and only re-read the (locked) shared list when it changed.
+    pub fn subscribe(&self) -> watch::Receiver<Vec<Tap>> {
+        self.taps_recv.clone()
+    }
+
     pub fn register(&self, tap: Tap) {
         let mut inner = self.inner.lock();
         inner.taps.push(tap);

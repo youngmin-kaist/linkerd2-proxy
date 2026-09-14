@@ -1,11 +1,14 @@
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_core::ready;
+use futures_core::{ready, Stream};
+use futures_util::stream::FuturesUnordered;
 use h2::server::{Connection, Handshake, SendResponse};
 use h2::{Reason, RecvStream};
 use http::{Method, Request};
@@ -40,6 +43,20 @@ const DEFAULT_MAX_SEND_BUF_SIZE: usize = 1024 * 400; // 400kb
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: u32 = 1024 * 16; // 16kb
 const DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 1024;
 
+/// Fairness bound for inline streams: at most this many stream-future polls
+/// per poll of the connection future. Beyond it, streams are deferred with a
+/// self-wake so the connection yields to sibling tasks on the same worker.
+/// (tokio's own per-task coop budget cannot be reset per stream from outside
+/// the runtime crate, so the connection is expected to be polled with an
+/// unconstrained budget in inline mode and this cap provides the fairness.)
+///
+/// Every round past the cap costs a self-wake for each remaining ready
+/// stream plus a full connection re-poll; measured on a 300-streams-per-
+/// connection load, a cap of 64 cost ~16% throughput (IPC 1.16 -> 0.92)
+/// while 4096 was at parity with spawned streams, so the default is set
+/// above typical per-connection concurrency.
+const INLINE_STREAM_POLL_CAP: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) adaptive_window: bool,
@@ -56,6 +73,10 @@ pub(crate) struct Config {
     pub(crate) header_table_size: Option<u32>,
     pub(crate) max_header_list_size: u32,
     pub(crate) date_header: bool,
+    pub(crate) selective_headers: Option<h2::selective::NeededSet>,
+    pub(crate) inline_streams: bool,
+    pub(crate) inline_stream_poll_cap: usize,
+    pub(crate) inline_flush_on_complete: bool,
 }
 
 impl Default for Config {
@@ -75,6 +96,10 @@ impl Default for Config {
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
             max_header_list_size: DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE,
             date_header: true,
+            selective_headers: None,
+            inline_streams: false,
+            inline_stream_poll_cap: INLINE_STREAM_POLL_CAP,
+            inline_flush_on_complete: true,
         }
     }
 }
@@ -88,13 +113,16 @@ pin_project! {
         exec: E,
         timer: Time,
         service: S,
-        state: State<T, B>,
+        state: State<T, S::Future, B, E>,
         date_header: bool,
+        inline_streams: bool,
+        inline_stream_poll_cap: usize,
+        inline_flush_on_complete: bool,
         close_pending: bool
     }
 }
 
-enum State<T, B>
+enum State<T, F, B, E>
 where
     B: Body,
 {
@@ -102,10 +130,10 @@ where
         ping_config: ping::Config,
         hs: Handshake<Compat<T>, SendBuf<B::Data>>,
     },
-    Serving(Serving<T, B>),
+    Serving(Serving<T, F, B, E>),
 }
 
-struct Serving<T, B>
+struct Serving<T, F, B, E>
 where
     B: Body,
 {
@@ -113,6 +141,46 @@ where
     conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
     date_header: bool,
+    /// Stream futures driven inline (empty unless `inline_streams`).
+    streams: FuturesUnordered<InlineStream<F, B, E>>,
+    /// Stream polls performed during the current connection poll.
+    stream_polls: Arc<AtomicUsize>,
+    inline_streams: bool,
+    inline_stream_poll_cap: usize,
+    inline_flush_on_complete: bool,
+}
+
+pin_project! {
+    /// An `H2Stream` polled inline by the connection, subject to the
+    /// per-connection-poll cap shared through `polls`.
+    struct InlineStream<F, B, E>
+    where
+        B: Body,
+    {
+        #[pin]
+        inner: H2Stream<F, B, E>,
+        polls: Arc<AtomicUsize>,
+        cap: usize,
+    }
+}
+
+impl<F, B, E> Future for InlineStream<F, B, E>
+where
+    B: Body,
+    E: Http2ServerConnExec<F, B>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        if this.polls.fetch_add(1, Ordering::Relaxed) >= *this.cap {
+            // Over the fairness cap for this connection poll: stay queued
+            // (self-wake) and let the connection yield.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        E::poll_h2stream(this.inner, cx)
+    }
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -150,6 +218,9 @@ where
         if config.enable_connect_protocol {
             builder.enable_connect_protocol();
         }
+        if let Some(needed) = &config.selective_headers {
+            builder.selective_headers(needed.clone());
+        }
         let handshake = builder.handshake(Compat::new(io));
 
         let bdp = if config.adaptive_window {
@@ -176,6 +247,9 @@ where
             },
             service,
             date_header: config.date_header,
+            inline_streams: config.inline_streams,
+            inline_stream_poll_cap: config.inline_stream_poll_cap,
+            inline_flush_on_complete: config.inline_flush_on_complete,
             close_pending: false,
         }
     }
@@ -225,6 +299,11 @@ where
                         conn,
                         closing: None,
                         date_header: me.date_header,
+                        streams: FuturesUnordered::new(),
+                        stream_polls: Arc::new(AtomicUsize::new(0)),
+                        inline_streams: me.inline_streams,
+                        inline_stream_poll_cap: me.inline_stream_poll_cap,
+                        inline_flush_on_complete: me.inline_flush_on_complete,
                     })
                 }
                 State::Serving(ref mut srv) => {
@@ -241,27 +320,61 @@ where
     }
 }
 
-impl<T, B> Serving<T, B>
+impl<T, F, B, E> Serving<T, F, B, E>
 where
     T: Read + Write + Unpin,
     B: Body + 'static,
+    E: Http2ServerConnExec<F, B>,
 {
-    fn poll_server<S, E>(
+    /// Polls the inline stream set. Returns whether any stream completed
+    /// (its response frames are queued on the connection, so the caller
+    /// should poll the connection again before yielding).
+    fn poll_streams(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut completed = false;
+        if self.streams.is_empty() {
+            return completed;
+        }
+        loop {
+            match Pin::new(&mut self.streams).poll_next(cx) {
+                Poll::Ready(Some(())) => completed = true,
+                // Empty, or every ready stream has been polled (or deferred
+                // past the cap, in which case the set already self-woke).
+                Poll::Ready(None) | Poll::Pending => return completed,
+            }
+        }
+    }
+
+    fn poll_server<S>(
         &mut self,
         cx: &mut Context<'_>,
         service: &mut S,
         exec: &mut E,
     ) -> Poll<crate::Result<()>>
     where
-        S: HttpService<IncomingBody, ResBody = B>,
+        S: HttpService<IncomingBody, ResBody = B, Future = F>,
         S::Error: Into<Box<dyn StdError + Send + Sync>>,
-        E: Http2ServerConnExec<S::Future, B>,
     {
         if self.closing.is_none() {
+            // The inline poll cap is per poll of the connection future.
+            self.stream_polls.store(0, Ordering::Relaxed);
             loop {
                 self.poll_ping(cx);
 
-                match ready!(self.conn.poll_accept(cx)) {
+                // Connection I/O (and accepting new streams) always comes
+                // first; inline streams are driven only once it is pending.
+                let accepted = match self.conn.poll_accept(cx) {
+                    Poll::Ready(accepted) => accepted,
+                    Poll::Pending => {
+                        if self.poll_streams(cx) && self.inline_flush_on_complete {
+                            // Responses were queued: flush them now rather
+                            // than waiting for the next wakeup.
+                            continue;
+                        }
+                        return Poll::Pending;
+                    }
+                };
+
+                match accepted {
                     Some(Ok((req, mut respond))) => {
                         trace!("incoming request");
                         let content_length = headers::content_length_parse_all(req.headers());
@@ -315,7 +428,15 @@ where
                             exec.clone(),
                         );
 
-                        exec.execute_h2stream(fut);
+                        if self.inline_streams {
+                            self.streams.push(InlineStream {
+                                inner: fut,
+                                polls: self.stream_polls.clone(),
+                                cap: self.inline_stream_poll_cap,
+                            });
+                        } else {
+                            exec.execute_h2stream(fut);
+                        }
                     }
                     Some(Err(e)) => {
                         return Poll::Ready(Err(crate::Error::new_h2(e)));

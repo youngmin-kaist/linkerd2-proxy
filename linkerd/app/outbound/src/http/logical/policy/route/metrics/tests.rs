@@ -1161,7 +1161,7 @@ pub fn mock_http_route_metrics(
 
     let svc = new_svc.new_service(Http {
         r#match,
-        params: Route {
+        params: std::sync::Arc::new(Route {
             parent: (),
             addr: std::net::SocketAddr::new([0, 0, 0, 0].into(), 8080).into(),
             parent_ref: parent_ref.clone(),
@@ -1172,7 +1172,7 @@ pub fn mock_http_route_metrics(
                 export_hostname_labels,
                 ..Default::default()
             },
-        },
+        }),
     });
 
     (svc::BoxHttp::new(svc), handle)
@@ -1224,7 +1224,7 @@ pub fn mock_grpc_route_metrics(
 
     let svc = new_svc.new_service(Grpc {
         r#match,
-        params: Route {
+        params: std::sync::Arc::new(Route {
             parent: (),
             addr: std::net::SocketAddr::new([0, 0, 0, 0].into(), 8080).into(),
             parent_ref: parent_ref.clone(),
@@ -1235,7 +1235,7 @@ pub fn mock_grpc_route_metrics(
                 export_hostname_labels,
                 ..Default::default()
             },
-        },
+        }),
     });
 
     (svc::BoxHttp::new(svc), handle)

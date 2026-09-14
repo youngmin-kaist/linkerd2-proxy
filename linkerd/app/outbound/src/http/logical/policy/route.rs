@@ -39,7 +39,12 @@ pub(crate) struct Route<T, F, P> {
     pub(super) params: P,
 }
 
-pub(crate) type MatchedRoute<T, M, F, P> = Matched<M, Route<T, F, P>>;
+/// The router's per-request key. The route is shared behind an `Arc` so that
+/// selecting a route (`SelectRoute::select`) is one refcount bump rather than
+/// a deep clone of the parent target, refs, filters and distribution, and so
+/// that the `MemoOneshotRoute` key comparison short-circuits on pointer
+/// equality (`Arc<T: Eq>`'s `PartialEq` checks `ptr_eq` first).
+pub(crate) type MatchedRoute<T, M, F, P> = Matched<M, Arc<Route<T, F, P>>>;
 pub(crate) type Http<T> = MatchedRoute<
     T,
     http_route::http::r#match::RequestMatch,

@@ -1,11 +1,16 @@
-use crate::{grpc::TapResponsePayload, registry::Registry, Inspect};
-use futures::ready;
+use crate::{
+    grpc::{Tap, TapResponsePayload},
+    registry::Registry,
+    Inspect,
+};
+use futures::{future, ready, TryFutureExt};
 use linkerd_proxy_http::HasH2Reason;
 use linkerd_stack::{layer, NewService};
 use pin_project::{pin_project, pinned_drop};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::sync::watch;
 
 /// Makes wrapped Services to record taps.
 #[derive(Clone, Debug)]
@@ -15,11 +20,18 @@ pub struct NewTapHttp<N> {
 }
 
 /// A middleware that records HTTP taps.
-#[derive(Clone, Debug)]
+///
+/// Holds a local snapshot of the registered taps, refreshed from the
+/// registry's watch only when it reports a change (one atomic load per
+/// request). When no taps are registered — the overwhelmingly common case —
+/// requests take a fast path that neither locks the registry nor boxes a
+/// future.
+#[derive(Debug)]
 pub struct TapHttp<S, I> {
     inner: S,
     inspect: I,
-    registry: Registry,
+    taps_rx: watch::Receiver<Vec<Tap>>,
+    taps: Vec<Tap>,
 }
 
 // A `Body` instrumented with taps.
@@ -54,12 +66,36 @@ where
     type Service = TapHttp<N::Service, I>;
 
     fn new_service(&self, target: I) -> Self::Service {
+        let mut taps_rx = self.registry.subscribe();
+        let taps = taps_rx.borrow_and_update().clone();
         TapHttp {
             inspect: target.clone(),
             inner: self.inner.new_service(target),
-            registry: self.registry.clone(),
+            taps_rx,
+            taps,
         }
     }
+}
+
+impl<S: Clone, I: Clone> Clone for TapHttp<S, I> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            inspect: self.inspect.clone(),
+            taps_rx: self.taps_rx.clone(),
+            taps: self.taps.clone(),
+        }
+    }
+}
+
+/// Wraps an untapped response body (no taps registered). `Vec::new()` does
+/// not allocate, so this is free.
+fn untapped<B>(rsp: http::Response<B>) -> http::Response<Body<B>>
+where
+    B: linkerd_proxy_http::Body,
+    B::Error: HasH2Reason,
+{
+    rsp.map(|inner| Body::new(inner, Vec::new()))
 }
 
 // === Service ===
@@ -77,7 +113,10 @@ where
 {
     type Response = http::Response<Body<B>>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, S::Error>> + Send + 'static>>;
+    type Future = future::Either<
+        future::MapOk<S::Future, fn(http::Response<B>) -> http::Response<Body<B>>>,
+        Pin<Box<dyn Future<Output = Result<Self::Response, S::Error>> + Send + 'static>>,
+    >;
 
     #[inline]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -85,17 +124,32 @@ where
     }
 
     fn call(&mut self, req: http::Request<A>) -> Self::Future {
+        // Refresh the snapshot only when the registry changed. `has_changed`
+        // errs only once the registry (sender) is gone; keep the last snapshot.
+        if let Ok(true) = self.taps_rx.has_changed() {
+            self.taps = self.taps_rx.borrow_and_update().clone();
+        }
+
+        // Fast path: no taps registered — no lock, no boxed future.
+        if self.taps.is_empty() {
+            return future::Either::Left(
+                self.inner
+                    .call(req)
+                    .map_ok(untapped::<B> as fn(http::Response<B>) -> http::Response<Body<B>>),
+            );
+        }
+
         // Record the request and obtain request-body and response taps.
         let mut rsp_taps = Vec::new();
 
-        for mut t in self.registry.get_taps() {
+        for mut t in self.taps.clone() {
             if let Some(rsp_tap) = t.tap(&req, &self.inspect) {
                 rsp_taps.push(rsp_tap);
             }
         }
 
         let call = self.inner.call(req);
-        Box::pin(async move {
+        future::Either::Right(Box::pin(async move {
             match call.await {
                 Ok(rsp) => {
                     // Tap the response headers and use the response
@@ -111,7 +165,7 @@ where
                     Err(e)
                 }
             }
-        })
+        }))
     }
 }
 

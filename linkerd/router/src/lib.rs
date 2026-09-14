@@ -320,3 +320,174 @@ where
         (self)(t)
     }
 }
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    #[derive(Debug)]
+    struct NoRoute;
+    impl std::fmt::Display for NoRoute {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("no route")
+        }
+    }
+    impl std::error::Error for NoRoute {}
+
+    /// Routes `req` to key `req / 10`; `0` has no route.
+    #[derive(Clone)]
+    struct Sel;
+    impl SelectRoute<u8> for Sel {
+        type Key = u8;
+        type Error = NoRoute;
+        fn select(&self, req: &u8) -> Result<u8, NoRoute> {
+            if *req == 0 {
+                return Err(NoRoute);
+            }
+            Ok(*req / 10)
+        }
+    }
+
+    /// Builds a `Svc` per key, counting how many were built.
+    #[derive(Clone)]
+    struct NewSvc {
+        built: Arc<AtomicUsize>,
+        ready: Arc<AtomicBool>,
+    }
+    impl NewService<u8> for NewSvc {
+        type Service = Svc;
+        fn new_service(&self, key: u8) -> Svc {
+            self.built.fetch_add(1, Ordering::SeqCst);
+            Svc {
+                key,
+                ready: self.ready.clone(),
+                calls: 0,
+            }
+        }
+    }
+
+    /// Responds with `(key, nth call on this instance)`.
+    struct Svc {
+        key: u8,
+        ready: Arc<AtomicBool>,
+        calls: usize,
+    }
+    impl Service<u8> for Svc {
+        type Response = (u8, usize);
+        type Error = Error;
+        type Future = future::Ready<Result<(u8, usize), Error>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            if self.ready.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn call(&mut self, _: u8) -> Self::Future {
+            self.calls += 1;
+            future::ok((self.key, self.calls))
+        }
+    }
+
+    fn mk() -> (MemoOneshotRoute<u8, Sel, NewSvc>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let built = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(true));
+        let route = MemoOneshotRoute {
+            select: Sel,
+            new_route: NewSvc {
+                built: built.clone(),
+                ready: ready.clone(),
+            },
+            cached: None,
+            _marker: PhantomData,
+        };
+        (route, built, ready)
+    }
+
+    fn poll<F: Future>(fut: F) -> Poll<F::Output> {
+        let mut fut = Box::pin(fut);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        Pin::new(&mut fut).poll(&mut cx)
+    }
+
+    fn call(route: &mut MemoOneshotRoute<u8, Sel, NewSvc>, req: u8) -> Poll<Result<(u8, usize), Error>> {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(route.poll_ready(&mut cx).is_ready());
+        poll(route.call(req))
+    }
+
+    #[test]
+    fn memo_hits_for_same_key() {
+        let (mut route, built, _) = mk();
+        // First request builds the route service and memoizes it.
+        assert!(matches!(call(&mut route, 11), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+        // Same key: the memoized instance is called directly (call count grows,
+        // nothing rebuilt).
+        assert!(matches!(call(&mut route, 12), Poll::Ready(Ok((1, 2)))));
+        assert!(matches!(call(&mut route, 19), Poll::Ready(Ok((1, 3)))));
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+        assert!(route.cached.as_ref().map(|(k, _)| *k) == Some(1));
+    }
+
+    #[test]
+    fn memo_invalidates_on_key_change() {
+        let (mut route, built, _) = mk();
+        assert!(matches!(call(&mut route, 11), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+        // A different key must never be served by the memoized instance.
+        assert!(matches!(call(&mut route, 25), Poll::Ready(Ok((2, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 2);
+        assert!(route.cached.as_ref().map(|(k, _)| *k) == Some(2));
+        // And switching back rebuilds again (only the last key is memoized).
+        assert!(matches!(call(&mut route, 15), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 3);
+        assert!(route.cached.as_ref().map(|(k, _)| *k) == Some(1));
+    }
+
+    #[test]
+    fn memo_skipped_when_not_ready() {
+        let (mut route, built, ready) = mk();
+        assert!(matches!(call(&mut route, 11), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+
+        // The memoized service becomes unready: the memo is dropped and the
+        // request falls back to a fresh clone driven by a Oneshot (pending).
+        ready.store(false, Ordering::SeqCst);
+        assert!(call(&mut route, 12).is_pending());
+        assert_eq!(built.load(Ordering::SeqCst), 2);
+        assert!(route.cached.is_none());
+
+        // Once ready again, the next request memoizes a new instance.
+        ready.store(true, Ordering::SeqCst);
+        assert!(matches!(call(&mut route, 13), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 3);
+        assert!(matches!(call(&mut route, 14), Poll::Ready(Ok((1, 2)))));
+        assert_eq!(built.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn no_route_is_an_error() {
+        let (mut route, built, _) = mk();
+        assert!(matches!(call(&mut route, 0), Poll::Ready(Err(_))));
+        assert_eq!(built.load(Ordering::SeqCst), 0);
+        assert!(route.cached.is_none());
+    }
+
+    #[test]
+    fn clone_starts_with_empty_memo() {
+        let (mut route, built, _) = mk();
+        assert!(matches!(call(&mut route, 11), Poll::Ready(Ok((1, 1)))));
+        let mut clone = route.clone();
+        assert!(clone.cached.is_none());
+        assert!(matches!(call(&mut clone, 11), Poll::Ready(Ok((1, 1)))));
+        assert_eq!(built.load(Ordering::SeqCst), 2);
+    }
+}
