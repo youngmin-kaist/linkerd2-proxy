@@ -1,6 +1,6 @@
 #!/bin/bash
 set -u
-cd /home/youngmin/DPUMesh/linkerd2-proxy
+cd $HOME/DPUMesh/linkerd2-proxy
 LOG=${DMESH_LOG_DIR:-/tmp}
 HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }

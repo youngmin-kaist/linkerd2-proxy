@@ -3,8 +3,8 @@
 set -u
 CORES=$1; P=$2; M=${3:-64}
 W=$CORES
-cd /home/youngmin/DPUMesh/linkerd2-proxy
-LOG=/home/youngmin/.claude/jobs/7d781695/tmp
+cd $HOME/DPUMesh/linkerd2-proxy
+LOG=$HOME/.claude/jobs/7d781695/tmp
 HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }
 die(){ step "FATAL: $*"; exit 1; }

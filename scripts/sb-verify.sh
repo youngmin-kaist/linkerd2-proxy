@@ -2,8 +2,8 @@
 # 11x decomposition cells — stepwise, gated. usage: sb-verify.sh <push|dpa> <timed|count> <CORES> [M] [load|curl]
 set -u
 TRANSPORT=$1; MEASURE=$2; CORES=$3; MCONC=${4:-100}; MODE=${5:-load}
-cd /home/youngmin/DPUMesh/linkerd2-proxy
-LOG=/home/youngmin/.claude/jobs/7d781695/tmp
+cd $HOME/DPUMesh/linkerd2-proxy
+LOG=$HOME/.claude/jobs/7d781695/tmp
 HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }
 die(){ step "FATAL: $*"; cleanup; exit 1; }

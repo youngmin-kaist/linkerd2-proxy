@@ -2,8 +2,8 @@
 # DSB over DMA with arbitrary replica spec. usage: dsb-dmesh-spec.sh <W> "<SPEC>"
 set -u
 W=${1:-16}; SPEC=${2:-}
-cd /home/youngmin/DPUMesh/linkerd2-proxy
-LOG=/home/youngmin/.claude/jobs/7d781695/tmp; HOST=192.168.100.1
+cd $HOME/DPUMesh/linkerd2-proxy
+LOG=$HOME/.claude/jobs/7d781695/tmp; HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }; die(){ step "FATAL: $*"; exit 1; }
 pkill -9 -f "release/linkerd2-pr""oxy" 2>/dev/null; pkill -9 -f "release/mo""ck-" 2>/dev/null
 timeout 20 ssh $HOST 'for b in frontend geo rate profile recommendation user reservation review attractions search; do pkill -9 -f "hotelres-dmesh/bin/$b" 2>/dev/null; done; true' </dev/null >/dev/null 2>&1

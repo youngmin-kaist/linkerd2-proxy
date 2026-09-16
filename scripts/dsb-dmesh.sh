@@ -2,8 +2,8 @@
 # DSB hotelReservation over the DMA transport: proxy + services + preflight.
 set -u
 W=${1:-8}
-cd /home/youngmin/DPUMesh/linkerd2-proxy
-LOG=/home/youngmin/.claude/jobs/7d781695/tmp
+cd $HOME/DPUMesh/linkerd2-proxy
+LOG=$HOME/.claude/jobs/7d781695/tmp
 HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }
 die(){ step "FATAL: $*"; exit 1; }

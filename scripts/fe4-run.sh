@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: fe4-run.sh <tcp|dmesh> <SPEC> <c_per_inst> <R_per_inst>   (4 frontends x 4 wrk2)
-MODE=$1; SPEC=$2; C=$3; R=$4; J=/home/youngmin/.claude/jobs/7d781695/tmp
+MODE=$1; SPEC=$2; C=$3; R=$4; J=$HOME/.claude/jobs/7d781695/tmp
 if [ "$MODE" = dmesh ]; then
   sed -i 's|bash /tmp/dsb_run_services.sh dmesh $W '"'"'$SPEC'"'"'"|bash /tmp/dsb_run_services.sh dmesh $W '"'"'$SPEC'"'"' 4"|' $J/dsb-dmesh-spec.sh
   bash $J/dsb-dmesh-spec.sh 16 "$SPEC" 2>&1 | grep -aE "listeners|FATAL|ready"
