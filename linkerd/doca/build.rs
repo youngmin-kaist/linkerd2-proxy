@@ -1,32 +1,33 @@
-use std::{collections::BTreeSet, env, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+// The DOCA transport lives in the parent repo at src/transport and is built
+// there by meson (`ninja -C src/transport/build`) into static archives:
+// libdmesh_dpu.a + libdmesh_common.a + libdmesh_host.a (the C datapath) and
+// device/dpa_kernel.a (the dpacc output). This script compiles only the shim and links those
+// archives, so the transport's source list exists in one place
+// (src/transport/meson.build).
+const TRANSPORT: &str = "../../../src/transport";
 
 fn main() {
-    for file in [
-        "src/shim.c",
-        "../../../DPUMesh/buffer.c",
-        "../../../DPUMesh/comch_client.c",
-        "../../../DPUMesh/comch_common.c",
-        "../../../DPUMesh/comch_consumer.c",
-        "../../../DPUMesh/comch_msgq.c",
-        "../../../DPUMesh/comch_server.c",
-        "../../../DPUMesh/common.c",
-        "../../../DPUMesh/dma.c",
-        "../../../DPUMesh/dpa.c",
-        "../../../DPUMesh/object.c",
-        "../../../DPUMesh/ring.c",
-        "../../../DPUMesh/build/device/dpa_kernel.a",
-        "../../../DPUMesh/buffer.h",
-        "../../../DPUMesh/comch_client.h",
-        "../../../DPUMesh/comch_common.h",
-        "../../../DPUMesh/comch_consumer.h",
-        "../../../DPUMesh/comch_msgq.h",
-        "../../../DPUMesh/comch_server.h",
-        "../../../DPUMesh/common.h",
-        "../../../DPUMesh/dma.h",
-        "../../../DPUMesh/object.h",
-        "../../../DPUMesh/dpa.h",
+    let transport = PathBuf::from(TRANSPORT);
+    let build_dir = transport.join("build");
+
+    println!("cargo:rerun-if-changed=src/shim.c");
+    for dir in ["common", "dpu", "host"] {
+        println!("cargo:rerun-if-changed={}", transport.join(dir).display());
+    }
+    for archive in [
+        "libdmesh_dpu.a",
+        "libdmesh_common.a",
+        "libdmesh_host.a",
+        "device/dpa_kernel.a",
     ] {
-        println!("cargo:rerun-if-changed={file}");
+        println!("cargo:rerun-if-changed={}", build_dir.join(archive).display());
     }
 
     let libs = [
@@ -50,17 +51,6 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .file("src/shim.c")
-        .file("../../../DPUMesh/buffer.c")
-        .file("../../../DPUMesh/comch_client.c")
-        .file("../../../DPUMesh/comch_common.c")
-        .file("../../../DPUMesh/comch_consumer.c")
-        .file("../../../DPUMesh/comch_msgq.c")
-        .file("../../../DPUMesh/comch_server.c")
-        .file("../../../DPUMesh/common.c")
-        .file("../../../DPUMesh/dma.c")
-        .file("../../../DPUMesh/dpa.c")
-        .file("../../../DPUMesh/object.c")
-        .file("../../../DPUMesh/ring.c")
         .flag_if_supported("-Wno-deprecated-declarations")
         .define("ALLOW_EXPERIMENTAL_API", None)
         .define("DOCA_ALLOW_EXPERIMENTAL_API", None)
@@ -69,18 +59,71 @@ fn main() {
     for path in include_paths {
         build.include(path);
     }
-
-    build.include("../../../DPUMesh");
+    for dir in ["common", "dpu", "host"] {
+        build.include(transport.join(dir));
+    }
 
     build.compile("dmesh_doca_shim");
 
-    let dpa_kernel = PathBuf::from("../../../DPUMesh/build/device/dpa_kernel.a")
-        .canonicalize()
-        .unwrap_or_else(|error| panic!("failed to find DPUMesh DPA kernel archive: {error}"));
+    // Copy the archives next to the shim so one link-search path covers them;
+    // dpacc names its output dpa_kernel.a (no lib prefix), which rustc's
+    // `-l static=` cannot find in place, and meson emits *thin* archives whose
+    // members are paths relative to the build dir, which rustc cannot bundle
+    // into the rlib - those are re-packed as regular archives.
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
-    let dpa_kernel_link = out_dir.join("libdpa_kernel.a");
-    fs::copy(&dpa_kernel, &dpa_kernel_link)
-        .unwrap_or_else(|error| panic!("failed to copy DPA kernel archive for linking: {error}"));
+    for (source, target) in [
+        ("libdmesh_dpu.a", "libdmesh_dpu.a"),
+        ("libdmesh_common.a", "libdmesh_common.a"),
+        ("libdmesh_host.a", "libdmesh_host.a"),
+        ("device/dpa_kernel.a", "libdpa_kernel.a"),
+    ] {
+        let from = build_dir.join(source).canonicalize().unwrap_or_else(|error| {
+            panic!(
+                "failed to find transport archive {source}: {error} \
+                 (run `ninja -C src/transport/build` in the parent repo first)"
+            )
+        });
+        copy_archive(&from, &out_dir.join(target));
+    }
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=dpa_kernel");
+    // All four go on the final link as whole archives: dpu and common reference
+    // each other both ways (object.c -> dma.c and back), and a plain `static=`
+    // library is bundled into the rlib, which the linker scans *before* the
+    // whole-archive objects that need it (client_send_msg, DPU_mesh_dpa_app).
+    println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_dpu");
+    println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_common");
+    println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_host");
+    println!("cargo:rustc-link-lib=static:+whole-archive=dpa_kernel");
+}
+
+/// Copies a static archive, re-packing a thin archive (`!<thin>` magic; its
+/// members are stored as paths relative to the archive's directory) into a
+/// regular one so rustc can bundle it.
+fn copy_archive(from: &Path, to: &Path) {
+    let magic = fs::read(from).unwrap_or_else(|error| panic!("failed to read {}: {error}", from.display()));
+    if !magic.starts_with(b"!<thin>\n") {
+        fs::copy(from, to)
+            .unwrap_or_else(|error| panic!("failed to copy {} for linking: {error}", from.display()));
+        return;
+    }
+    let base = from.parent().expect("archive path has a parent");
+    let listing = Command::new("ar")
+        .arg("t")
+        .arg(from)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run `ar t {}`: {error}", from.display()));
+    assert!(listing.status.success(), "`ar t {}` failed", from.display());
+    let members: Vec<PathBuf> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|member| base.join(member))
+        .collect();
+    let _ = fs::remove_file(to);
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(to)
+        .args(&members)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run `ar crs {}`: {error}", to.display()));
+    assert!(status.success(), "re-packing {} into {} failed", from.display(), to.display());
 }

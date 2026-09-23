@@ -17,18 +17,18 @@ host에도 같은 클론을 두고(관례상 `~/bf-workspace`) 동일 커밋으�
 ## 2. 빌드 순서 (반드시 이 순서)
 **DPU**
 ```bash
-cd DPUMesh && meson setup build && ninja -C build        # C 데이터패스 + dpacc(device/dpa_kernel.a)
-cd ../linkerd2-proxy && cargo build --release -p linkerd2-proxy   # doca 기본 feature; shim이 ../DPUMesh/*.c 직접 컴파일
+cd src/transport && meson setup build && ninja -C build        # C 데이터패스 + dpacc(device/dpa_kernel.a)
+cd ../linkerd2-proxy && cargo build --release -p linkerd2-proxy   # doca 기본 feature; shim + src/transport archive link
 ```
-- 프록시는 `DPUMesh/build/device/dpa_kernel.a`를 정적 링크 → ninja가 먼저.
+- 프록시는 `src/transport/build/libdmesh_{dpu,common,host}.a`와 `device/dpa_kernel.a`를 정적 링크 → ninja가 먼저.
 - **cargo 출력에서 `Finished`를 눈으로 확인**할 것. C 헤더 불일치 등으로 조용히 실패하면 옛
   바이너리로 측정하게 됨(실제로 두 라운드를 날린 함정). `ls -l target/release/linkerd2-proxy` 시각 확인.
 
 **host**
 ```bash
-cd ~/bf-workspace/DPUMesh && meson setup build && ninja -C build   # libdmesh_host.so + dpumesh(브리지)
+cd ~/bf-workspace/src/transport && meson setup build && ninja -C build   # libdmesh_hostlib.so + dpumesh(브리지)
 ```
-dmeshgo(Go)는 cgo로 `${SRCDIR}/../build/libdmesh_host.so`를 rpath로 찾는다 → 리포 배치를 바꾸지 말 것.
+dmeshgo(Go)는 cgo로 `${SRCDIR}/../../src/transport/build/libdmesh_hostlib.so`를 rpath로 찾는다 → 리포 배치를 바꾸지 말 것.
 
 ## 3. 머신별 설정
 - 프록시: `linkerd2-proxy/scripts/dev-proxy-env.sh`가 `LINKERD2_PROXY_DOCA_DEV_PCI_ADDR`(`03:00.1`),

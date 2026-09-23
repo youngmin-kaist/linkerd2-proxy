@@ -29,7 +29,7 @@ nginx ◀─TCP─ host backend bridge ◀──push DMA─│  hyper client    
 A `DmeshEvent::ConnReady` carrying `is_backend` becomes a hyper *client* over
 that channel, registered under the flow's destination. Any other `ConnReady`
 becomes a hyper h2 *server*; each stream is routed to a registered channel.
-Both host bridges already exist in `DPUMesh/host_worker.c` — the router needs no
+Both host bridges already exist in `src/transport/legacy/host_worker.c` — the router needs no
 C-side changes.
 
 ## Configuration (environment only)
@@ -114,7 +114,7 @@ running router PID during a sustained h2load run.
 ## Build
 
 ```bash
-ninja -C ../../DPUMesh/build           # dpa_kernel.a must exist; dmesh-doca links it
+ninja -C ../../src/transport/build     # transport archives + dpa_kernel.a must exist; dmesh-doca links them
 cargo build --release -p dmesh-router
 ```
 
