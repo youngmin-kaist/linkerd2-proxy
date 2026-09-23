@@ -11,7 +11,7 @@ die(){ step "FATAL: $*"; exit 1; }
 
 step "0. clean (C=$CORES W=$W P=$P M=$M)"
 pkill -f "release/linkerd2-proxy" 2>/dev/null; pkill -f "release/mock-" 2>/dev/null
-timeout 20 ssh $HOST 'pkill -f bench-ser; pkill -f bench-cli; pkill -f "build/dpumesh"; true' </dev/null >/dev/null 2>&1
+timeout 20 ssh $HOST 'pkill -f bench-ser; pkill -f bench-cli; pkill -x dpumesh_v0_host; true' </dev/null >/dev/null 2>&1
 sleep 10
 
 step "1. mocks + proxy (sharded W=$W, no-teardown)"
@@ -46,4 +46,4 @@ HTTP_N=$(curl -s --max-time 5 http://127.0.0.1:4991/metrics | awk '/^request_tot
 echo "   outbound request_total 합계 = ${HTTP_N:-fail}"
 step "done"
 pkill -f "release/linkerd2-proxy" 2>/dev/null; pkill -f "release/mock-" 2>/dev/null
-timeout 20 ssh $HOST 'pkill -f bench-ser; pkill -f "build/dpumesh"; true' </dev/null >/dev/null 2>&1
+timeout 20 ssh $HOST 'pkill -f bench-ser; pkill -x dpumesh_v0_host; true' </dev/null >/dev/null 2>&1

@@ -26,9 +26,11 @@ cd ../linkerd2-proxy && cargo build --release -p linkerd2-proxy   # doca 기본 
 
 **host**
 ```bash
-cd ~/bf-workspace/src/transport && meson setup build && ninja -C build   # libdmesh_hostlib.so + dpumesh(브리지)
+cd ~/bf-workspace/src/transport && meson setup build && ninja -C build   # transport archives
+cd ../../apps/dma_bench && meson setup build && ninja -C build           # dpumesh_host + dpumesh_v0_host(브리지); make lib 먼저
+cd ../dmeshgo/hostlib && meson setup build && ninja -C build             # libdmesh_hostlib.so
 ```
-dmeshgo(Go)는 cgo로 `${SRCDIR}/../../src/transport/build/libdmesh_hostlib.so`를 rpath로 찾는다 → 리포 배치를 바꾸지 말 것.
+dmeshgo(Go)는 cgo로 `${SRCDIR}/hostlib/build/libdmesh_hostlib.so`를 rpath로 찾는다 → 리포 배치를 바꾸지 말 것.
 
 ## 3. 머신별 설정
 - 프록시: `linkerd2-proxy/scripts/dev-proxy-env.sh`가 `LINKERD2_PROXY_DOCA_DEV_PCI_ADDR`(`03:00.1`),

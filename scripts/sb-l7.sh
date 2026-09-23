@@ -36,13 +36,13 @@ step "   $S comch servers up"
 
 step "2. $M backend bridges"
 timeout 15 ssh $HOST "rm -f /tmp/ym_h2_*.log /tmp/ym_in_*.log /tmp/ym_be_*.log" </dev/null >/dev/null 2>&1
-timeout 8 ssh $HOST "cd ~/bf-workspace && for j in \$(seq 0 $((M-1))); do setsid env DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.\$((1+j)) DMESH_DST_PORT=8086 DMESH_SERVER_IDX=\$((j % $W)) ./build/dpumesh -p 94:00.1 -t 1 -d 1 > /tmp/ym_be_\$j.log 2>&1 </dev/null & done; exit 0" </dev/null >/dev/null 2>&1
+timeout 8 ssh $HOST "cd ~/bf-workspace && for j in \$(seq 0 $((M-1))); do setsid env DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.\$((1+j)) DMESH_DST_PORT=8086 DMESH_SERVER_IDX=\$((j % $W)) ./apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1 > /tmp/ym_be_\$j.log 2>&1 </dev/null & done; exit 0" </dev/null >/dev/null 2>&1
 for i in $(seq 1 30); do [ "$(grep -ac "Push channel ready (mode 1)" $LOG/dproxy.log 2>/dev/null)" -ge "$M" ] && break; sleep 1; done
 B=$(grep -ac "Push channel ready (mode 1)" $LOG/dproxy.log); [ "$B" -ge "$M" ] || die "backend channels $B/$M"
 step "   $B backend channels ready (nginx 60s window open)"
 
 step "3. $M ingress bridges (listen-first; channel attaches on client connect)"
-timeout 8 ssh $HOST "cd ~/bf-workspace && for i in \$(seq 0 $((M-1))); do rm -f /tmp/ym_in_\$i.log; setsid env DMESH_PUSH_BRIDGE_PORT=\$((38080+i)) DMESH_DST_IP=10.0.0.\$((1+i)) DMESH_DST_PORT=8086 DMESH_SERVER_IDX=\$((i % $W)) ./build/dpumesh -p 94:00.1 -t 1 -d 1 > /tmp/ym_in_\$i.log 2>&1 </dev/null & done; exit 0" </dev/null >/dev/null 2>&1
+timeout 8 ssh $HOST "cd ~/bf-workspace && for i in \$(seq 0 $((M-1))); do rm -f /tmp/ym_in_\$i.log; setsid env DMESH_PUSH_BRIDGE_PORT=\$((38080+i)) DMESH_DST_IP=10.0.0.\$((1+i)) DMESH_DST_PORT=8086 DMESH_SERVER_IDX=\$((i % $W)) ./apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1 > /tmp/ym_in_\$i.log 2>&1 </dev/null & done; exit 0" </dev/null >/dev/null 2>&1
 LIS=0; for t in $(seq 1 20); do LIS=$(timeout 15 ssh $HOST "grep -al 'push-ingress: listening' /tmp/ym_in_*.log 2>/dev/null | wc -l" </dev/null 2>/dev/null | tr -dc 0-9); [ "${LIS:-0}" -ge "$M" ] && break; sleep 2; done
 [ "${LIS:-0}" -ge "$M" ] || die "ingress listening $LIS/$M"
 step "   $LIS/$M listening"

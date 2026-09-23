@@ -32,14 +32,14 @@ grep -aq "Started DOCA comch server" $LOG/dproxy.log || die "comch server not up
 step "   proxy server up"
 
 step "2. backend bridge (nginx client_header_timeout=60s => curl must fire within 60s of THIS)"
-timeout 12 ssh $HOST "cd ~/bf-workspace && rm -f /tmp/ym_be_0.log && setsid env DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 DMESH_SERVER_IDX=0 ./build/dpumesh -p 94:00.1 -t 1 -d 1 > /tmp/ym_be_0.log 2>&1 </dev/null & exit 0" </dev/null >/dev/null 2>&1
+timeout 12 ssh $HOST "cd ~/bf-workspace && rm -f /tmp/ym_be_0.log && setsid env DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 DMESH_SERVER_IDX=0 ./apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1 > /tmp/ym_be_0.log 2>&1 </dev/null & exit 0" </dev/null >/dev/null 2>&1
 for i in $(seq 1 25); do grep -aq "Push channel ready (mode 1)" $LOG/dproxy.log 2>/dev/null && break; sleep 1; done
 grep -aq "Push channel ready (mode 1)" $LOG/dproxy.log || die "backend channel not ready (dproxy: $(tail -2 $LOG/dproxy.log | tr '\n' ' '))"
 step "   backend channel ready"
 
 step "3. ingress bridge"
 if [ "$TRANSPORT" = "push" ]; then ING="DMESH_PUSH_BRIDGE_PORT=28080"; else ING="DMESH_BRIDGE_PORT=28080 DMESH_REV_PCI=94:00.1"; fi
-timeout 12 ssh $HOST "cd ~/bf-workspace && rm -f /tmp/ym_in_0.log && setsid env $ING DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 DMESH_SERVER_IDX=0 ./build/dpumesh -p 94:00.1 -t 1 -d 1 > /tmp/ym_in_0.log 2>&1 </dev/null & exit 0" </dev/null >/dev/null 2>&1
+timeout 12 ssh $HOST "cd ~/bf-workspace && rm -f /tmp/ym_in_0.log && setsid env $ING DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 DMESH_SERVER_IDX=0 ./apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1 > /tmp/ym_in_0.log 2>&1 </dev/null & exit 0" </dev/null >/dev/null 2>&1
 for i in $(seq 1 25); do grep -aq "Push channel ready (mode 2)" $LOG/dproxy.log 2>/dev/null && break; sleep 1; done
 LIS=$(timeout 20 ssh $HOST "grep -ac 'listening' /tmp/ym_in_0.log 2>/dev/null" </dev/null 2>/dev/null | tr -dc 0-9)
 [ "${LIS:-0}" -ge 1 ] || die "ingress not listening (remote log: $(timeout 20 ssh $HOST 'tail -2 /tmp/ym_in_0.log' </dev/null 2>/dev/null | tr '\n' ' '))"

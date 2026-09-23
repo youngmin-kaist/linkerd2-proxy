@@ -29,7 +29,7 @@ nginx ◀─TCP─ host backend bridge ◀──push DMA─│  hyper client    
 A `DmeshEvent::ConnReady` carrying `is_backend` becomes a hyper *client* over
 that channel, registered under the flow's destination. Any other `ConnReady`
 becomes a hyper h2 *server*; each stream is routed to a registered channel.
-Both host bridges already exist in `src/transport/legacy/host_worker.c` — the router needs no
+Both host bridges already exist in `apps/dma_bench/host/host_worker.c` — the router needs no
 C-side changes.
 
 ## Configuration (environment only)
@@ -133,10 +133,10 @@ restarted per run:
 ```bash
 cd ~/bf-workspace
 DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ./build/dpumesh -p 94:00.1 -t 1 -d 1        # nginx over DMA (DPA-free push path)
+  apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1        # nginx over DMA (DPA-free push path)
 
 DMESH_BRIDGE_PORT=8080 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ./build/dpumesh -p 94:00.1 -t 1 -d 1        # h2load ingress (needs host DPA on 94:00.0)
+  apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1        # h2load ingress (needs host DPA on 94:00.0)
 
 h2load -c1 -m100 -n20000 http://127.0.0.1:8080/
 ```
