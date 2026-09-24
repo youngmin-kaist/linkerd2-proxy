@@ -439,7 +439,7 @@ int32_t dmesh_doca_conn_mode_get(struct objects *objs, int32_t slot)
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 	/* BACKEND_PULL is a backend flow whose reverse path the host's DPA pulls
-	 * (the host library's pull wire); the role is what callers switch on, the
+	 * (the host library's host-dpa reverse path); the role is what callers switch on, the
 	 * wire is the datapath's business (DMESH_FLOW_USES_PUSH on flow.mode). */
 	if (objs->conns[slot].flow.mode == DMESH_FLOW_MODE_BACKEND_PULL)
 		return (int32_t)DMESH_FLOW_MODE_BACKEND;
